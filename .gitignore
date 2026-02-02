@@ -77,12 +77,4 @@ dmypy.json
 # macOS
 .DS_Store
 
-# Project Specific - Data and Models
-# (Remove these if you want to track them in Git, though usually not recommended for large files)
-*.joblib
-*.mmdb
-*.xlsx
-*.csv
-found.txt
-merge.txt
-uploads/
+
