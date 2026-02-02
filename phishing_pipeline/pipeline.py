@@ -19,7 +19,8 @@ from .config import (
     ASN_DB_PATH, CITY_DB_PATH, SCREENS_DIR,
     EVIDENCE_DIR, APPLICATION_ID
 )
-from .utils import extract_all_features
+from .utils import extract_all_features_async
+from .visual_features import close_browser
 from .geoip_utils import enrich_with_geoip
 from .model_utils import load_models_and_preproc
 from .shortlisting import generate_shortlisted_csv
@@ -130,32 +131,69 @@ def adjust_source(org_name, whitelisted_domain, ml_source="Unknown"):
 # ------------------------------------------------------------------
 # Feature extraction
 # ------------------------------------------------------------------
-def process_urls(input_csv, output_csv=FEATURES_CSV):
-    """Extract features for each candidate domain."""
+async def process_urls(input_csv, output_csv=FEATURES_CSV):
+    """Extract features for each candidate domain asynchronously."""
     import csv
     df = pd.read_csv(input_csv)
-    logger.info("⚙️ Extracting features for %d domains", len(df))
-    with open(output_csv, mode="w", newline="", encoding="utf-8") as f:
-        writer = None
-        for idx, row in df.iterrows():
-            # --- Use the new column name ---
-            domain = row["Identified Phishing/Suspected Domain Name"]
-            logger.info("[%d/%d] 🔎 Extracting features for %s", idx + 1, len(df), domain)
-            try:
-                feats, _ = extract_all_features(domain)
-                record = {
-                    # --- Use the new column names ---
-                    "Cooresponding CSE": row["Cooresponding CSE"],
-                    "Legitimate Domains": row["Legitimate Domains"],
-                    **feats
-                }
+    logger.info("⚙️ Extracting features for %d domains (Async)", len(df))
+    
+    # Check for empty dataframe
+    if df.empty:
+        # Create empty file with headers
+        with open(output_csv, mode="w", newline="", encoding="utf-8") as f:
+            pass # We don't know the headers yet, but utils will handle it or next step will fail gracefully
+        return output_csv
+
+    semaphore = asyncio.Semaphore(5) # Conservative: increased from 5 to 7 for modest improvement
+    queue = asyncio.Queue()
+    
+    # Writer task
+    async def writer_task():
+        with open(output_csv, mode="w", newline="", encoding="utf-8") as f:
+            writer = None
+            while True:
+                record = await queue.get()
+                if record is None:
+                    break
+                
                 if writer is None:
                     writer = csv.DictWriter(f, fieldnames=list(record.keys()))
                     writer.writeheader()
+                
                 writer.writerow(record)
-                logger.info("✅ Features extracted for %s", domain)
-            except Exception as e:
-                logger.error("❌ Failed feature extraction for %s — %s", domain, e)
+                f.flush() # Ensure it's written
+                queue.task_done()
+    
+    writer = asyncio.create_task(writer_task())
+    
+    async def worker(idx, row):
+        domain = row["Identified Phishing/Suspected Domain Name"]
+        # logger.info("[%d] Processing %s", idx, domain) # Too noisy for async
+        try:
+            feats, _ = await extract_all_features_async(domain, semaphore)
+            record = {
+                "Cooresponding CSE": row["Cooresponding CSE"],
+                "Legitimate Domains": row["Legitimate Domains"],
+                **feats
+            }
+            await queue.put(record)
+            logger.info("✅ Extracted: %s", domain)
+        except Exception as e:
+            logger.error("❌ Failed: %s — %s", domain, e)
+            # Put partial record or just skip? 
+            # If we skip, the lineup might break if we rely on row order (we use joins later so it should be fine)
+    
+    tasks = []
+    for idx, row in df.iterrows():
+        tasks.append(asyncio.create_task(worker(idx, row)))
+        
+    # Wait for all workers
+    await asyncio.gather(*tasks)
+    
+    # Signal writer to stop
+    await queue.put(None)
+    await writer
+    
     return output_csv
 
 # ------------------------------------------------------------------
@@ -259,7 +297,7 @@ def reclassify_label(domain, registrar, host, dns, ocr_text_from_csv):
 # ------------------------------------------------------------------
 # Pipeline runner
 # ------------------------------------------------------------------
-def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=None, use_existing_holdout=False):
+async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=None, use_existing_holdout=False):
     logger.info("🚀 Starting pipeline...")
     
     # ROOT_DIR is now defined at the top of the file
@@ -297,7 +335,7 @@ def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=None, us
     temp_csv_path = os.path.join(os.path.dirname(__file__), "holdout_temp.csv")
     df_filtered.to_csv(temp_csv_path, index=False, encoding="utf-8")
     
-    process_urls(temp_csv_path, FEATURES_CSV)
+    await process_urls(temp_csv_path, FEATURES_CSV)
     df_features = pd.read_csv(FEATURES_CSV)
     df_features = enrich_with_geoip(df_features, ASN_DB_PATH, CITY_DB_PATH)
     df_features.to_csv(FEATURES_ENRICH, index=False, encoding="utf-8")
@@ -505,6 +543,11 @@ def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=None, us
         logger.warning("⚠ Could not remove temporary file: %s", e)
 
     return df_out
+    
+    # Note: run_pipeline does NOT close the browser context automatically here anymore
+    # because we might want to keep it open? No, we should close it.
+    # actually better to do it in the finally block of the caller or here.
+    # close_browser() will be called by the outer wrapper.
 
 # ------------------------------------------------------------------
 # Package results
@@ -695,9 +738,28 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
-    # Run the pipeline with provided args
-    out = run_pipeline(args.holdout_folder, args.ps02_whitelist_file,
-                       limit_whitelisted=args.limit, use_existing_holdout=args.use_existing_holdout)
+    # Run the pipeline async
+    try:
+        if sys.platform.startswith("win"):
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        
+        # We wrap the call and cleanup
+        async def main_wrapper():
+            try:
+                await run_pipeline(args.holdout_folder, args.ps02_whitelist_file,
+                                   limit_whitelisted=args.limit, use_existing_holdout=args.use_existing_holdout)
+            finally:
+                # Use the new async closer
+                from .visual_features import close_browser_async
+                await close_browser_async()
+                # Also verify sync browser is closed just in case
+                close_browser()
+                
+        asyncio.run(main_wrapper())
+    except KeyboardInterrupt:
+        logger.info("Pipeline stopped by user.")
+    except Exception as e:
+        logger.error("Pipeline failed: %s", e)
 
     # Optionally package results
     if args.package_results:

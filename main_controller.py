@@ -58,7 +58,7 @@ except ImportError as e:
     shortlisting = None
 
 
-def main():
+async def main():
     parser = argparse.ArgumentParser(description="Phishing Detection CLI Controller")
     
     # ---
@@ -112,7 +112,7 @@ def main():
             # 2. Run Pipeline
             logger.info("--- Starting Step 2: Running Main Pipeline ---")
             
-            df_out = run_pipeline(
+            df_out = await run_pipeline(
                 holdout_folder=args.shortlisting, 
                 ps02_whitelist_file=args.whitelist,
                 limit_whitelisted=args.limit if args.limit else None,
@@ -125,17 +125,13 @@ def main():
         elif run_pipeline is not None:
             logger.warning("Could not find shortlisting.run_shortlisting_process. Falling back to old pipeline-only mode.")
             try:
-                df_out = run_pipeline(
+                df_out = await run_pipeline(
                     holdout_folder=args.shortlisting, 
                     ps02_whitelist_file=args.whitelist,
                     limit_whitelisted=args.limit if args.limit else None
                 )
             except TypeError:
-                # ---
-                # --- FIX 2: Call run_pipeline with args.shortlisting (not args.holdout)
-                # ---
-                df_out = run_pipeline(args.shortlisting, args.whitelist, args.limit)
-                # --- (End of Fix 2) ---
+                df_out = await run_pipeline(args.shortlisting, args.whitelist, args.limit)
         else:
             raise RuntimeError("No suitable pipeline entrypoint found (shortlisting.run_shortlisting_process or run_pipeline).")
 
@@ -169,5 +165,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
     
