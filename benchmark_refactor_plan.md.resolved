@@ -1,0 +1,29 @@
+# Refactoring Benchmark for End-to-End Testing
+
+This plan details how to update [benchmark.py](file:///c:/Users/SATWIK/Documents/Phishing/benchmark.py) to measure the performance of the entire phishing detection pipeline as requested.
+
+## Proposed Changes
+
+### [Root] Benchmark Tool
+
+#### [MODIFY] [benchmark.py](file:///c:/Users/SATWIK/Documents/Phishing/benchmark.py)
+*   **Step 1: Initialization**
+    *   Set up paths for [PS-02_hold-out_Set_2/PS-02_hold-out_Set_2_Part_1.xlsx](file:///c:/Users/SATWIK/Documents/Phishing/PS-02_hold-out_Set_2/PS-02_hold-out_Set_2_Part_1.xlsx).
+    *   Import necessary modules from `phishing_pipeline`.
+*   **Step 2: End-to-End Orchestration**
+    *   Implement a new `timed_main_controller()` function.
+    *   **Phase 1: Shortlisting** - Measure the time taken by `shortlisting.run_shortlisting_process`.
+    *   **Phase 2: Pipeline Execution** - Measure the time taken by `pipeline.run_pipeline` (includes feature extraction, GeoIP, and Model Prediction).
+    *   **Phase 3: Packaging** - Measure the time taken by `pipeline.package_results`.
+*   **Step 3: Metrics Reporting**
+    *   Report total duration, per-phase duration, and per-domain throughput (seconds/domain).
+    *   Include memory/CPU usage snapshots using `psutil`.
+
+## Verification Plan
+
+### Automated Tests
+*   Run `python benchmark.py` and verify that it correctly identifies the dataset and executes all steps.
+*   Ensure the output artifacts (CSVs, Excel, ZIP) are generated in their respective locations.
+
+### Manual Verification
+*   Check the console output for the summary table of timings.

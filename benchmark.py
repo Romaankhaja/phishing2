@@ -1,127 +1,141 @@
+
+# =================== BENCHMARK: FULL MAIN PIPELINE ===================
 import sys
 import os
 import asyncio
-import sys
 import pandas as pd
 import time
-from phishing_pipeline import pipeline, visual_features, utils
+import psutil
+import torch
+import gc
+import logging
+from datetime import datetime
+from phishing_pipeline import pipeline, shortlisting, visual_features
+from phishing_pipeline.config import FINAL_OUTPUT
 
-# setup paths
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# mimic the structure pipeline expects
-HOLDOUT_CSV = "benchmark_holdout.csv"
-WHITELIST_XLS = "benchmark_whitelist.xlsx"
-OUTPUT_CSV = "benchmark_output.csv"
+DATASET_PATH = "PS-02_hold-out_Set_2/PS-02_hold-out_Set_2_Part_1.xlsx"
+WHITELIST_PATH = "uploads/PS-02_hold-out_Set1_Legitimate_Domains_for_10_CSEs.xlsx"
+LIMIT_SAMPLES = None  # Set to None for full run, or e.g. 100 for quick test
 
-# 1. Load real dataset from PS-02_hold-out_Set_2_Part_1
-def load_real_dataset():
-    print("Loading real dataset from PS-02_hold-out_Set_2_Part_1.xlsx...")
-    # Read the first dataset
-    df = pd.read_excel("PS-02_hold-out_Set_2/PS-02_hold-out_Set_2_Part_1.xlsx")
-    
-    # Convert domain_name column to expected format
-    df = df.rename(columns={"domain_name": "Identified Phishing/Suspected Domain Name"})
-    df["Cooresponding CSE"] = "Phishing"
-    df["Legitimate Domains"] = ""
-    
-    # Save as CSV for pipeline processing
-    df.to_csv(HOLDOUT_CSV, index=False)
-    
-    # create dummy whitelist (pipeline checks this)
-    df_wl = pd.DataFrame({"Legitimate Domains": [""]})
-    df_wl.to_excel(WHITELIST_XLS, index=False)
-    
-    return HOLDOUT_CSV, len(df)
+def get_stats():
+    cpu_mem = psutil.virtual_memory().percent
+    gpu_mem = torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory if torch.cuda.is_available() else 0
+    return cpu_mem, gpu_mem
 
-# 2. Run pipeline
-async def run_benchmark():
-    holdout_file, num_domains = load_real_dataset()
-    import psutil
-    import torch
-    import gc
-    batch_size = 100
-    min_batch_size = 10
-    max_domains = num_domains
-    print(f"starting benchmark on {holdout_file} ({num_domains} domains)...")
-    start_time = time.time()
-    df = pd.read_csv(holdout_file)
-    total = len(df)
-    processed = 0
-    batch_num = 0
-    import tempfile
-    import shutil
-    first_batch = True
-    temp_files = []
-    while processed < total:
-        batch_num += 1
-        end_idx = min(processed + batch_size, total)
-        batch = df.iloc[processed:end_idx]
-        print(f"\n[Batch {batch_num}] Processing domains {processed+1}-{end_idx} of {total} (batch size: {batch_size})")
-        # Monitor memory before batch
-        cpu_mem = psutil.virtual_memory().percent
-        gpu_mem = torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory if torch.cuda.is_available() else 0
-        print(f"  [Memory] CPU: {cpu_mem:.1f}%  GPU: {gpu_mem*100:.1f}%")
-        # Write each batch to a temp file, then append to OUTPUT_CSV
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as tmp:
-            temp_file = tmp.name
-        temp_files.append(temp_file)
-        # Save batch to temp CSV for process_urls
-        batch.to_csv(temp_file, index=False)
-        try:
-            await pipeline.process_urls(temp_file, temp_file)
-            # Append to OUTPUT_CSV
-            if first_batch:
-                shutil.copyfile(temp_file, OUTPUT_CSV)
-                first_batch = False
-            else:
-                # Append without header
-                with open(temp_file, 'r', encoding='utf-8') as src, open(OUTPUT_CSV, 'a', encoding='utf-8') as dst:
-                    next(src)  # skip header
-                    shutil.copyfileobj(src, dst)
-        except Exception as e:
-            print(f"  [Batch {batch_num}] Error: {e}")
-        processed = end_idx
-        # Cleanup after batch
-        try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
-        gc.collect()
-        # Monitor memory after batch
-        cpu_mem = psutil.virtual_memory().percent
-        gpu_mem = torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory if torch.cuda.is_available() else 0
-        print(f"  [After Batch] CPU: {cpu_mem:.1f}%  GPU: {gpu_mem*100:.1f}%")
-        # Adaptive batch size
-        if cpu_mem > 85 or gpu_mem > 0.8:
-            batch_size = max(min_batch_size, batch_size // 2)
-            print(f"  [Batch {batch_num}] High memory usage detected. Reducing batch size to {batch_size}.")
-        elif cpu_mem < 60 and gpu_mem < 0.5 and batch_size < 100:
-            batch_size = min(100, batch_size * 2)
-    # Cleanup temp files
-    for f in temp_files:
-        try:
-            os.remove(f)
-        except Exception:
-            pass
-    end_time = time.time()
-    duration = end_time - start_time
-    print(f"\n==========================================")
-    print(f"BENCHMARK COMPLETED")
-    print(f"Time taken: {duration:.2f} seconds")
-    print(f"Domains processed: {num_domains}")
-    print(f"Speed: {duration/num_domains:.2f} seconds/domain")
-    print(f"Output saved to: {OUTPUT_CSV}")
-    print(f"==========================================")
+async def run_full_pipeline_benchmark():
+    print("\n" + "="*70)
+    print("🚀 PHISHING PIPELINE: FULL END-TO-END BENCHMARK")
+    print("="*70)
+
+
+    # 1. Shortlisting (load/process only the specified file)
+    print(f"\n[STEP 1] Shortlisting with Legitimate CSE Domains (Single File)...")
+    if not os.path.exists(DATASET_PATH):
+        print(f"❌ Dataset not found: {DATASET_PATH}")
+        return
+    if not os.path.exists(WHITELIST_PATH):
+        print(f"❌ Whitelist not found: {WHITELIST_PATH}")
+        return
+    import pandas as pd
+    start_short = time.time()
+    try:
+        # Load only the specified Excel file
+        df = pd.read_excel(DATASET_PATH)
+        print(f"Loaded {len(df)} rows from {DATASET_PATH}")
+        # Use all domains for benchmarking (skip whitelist filtering)
+        if 'domain_name' not in df.columns:
+            print("❌ Could not find 'domain_name' column in dataset.")
+            return
+        df['domain'] = df['domain_name'].astype(str).str.lower()
+        filtered_df = df.copy()
+        # Add 'Legitimate Domains' column to match pipeline expectations
+        filtered_df['Legitimate Domains'] = filtered_df['domain']
+        n_candidates = len(filtered_df)
+        print(f"✅ Shortlisting complete: {n_candidates} candidates from {os.path.basename(DATASET_PATH)} (no whitelist filtering).")
+        print(f"DataFrame shape: {filtered_df.shape}")
+        if n_candidates == 0:
+            print("❌ No data to process. Exiting benchmark before pipeline step.")
+            return
+        import os
+        holdout_path = os.path.abspath('holdout.csv')
+        filtered_df.to_csv(holdout_path, index=False)
+        print(f"holdout.csv written to: {holdout_path}")
+        print(f"holdout.csv columns: {list(filtered_df.columns)}")
+        print("Sample of holdout.csv:")
+        print(filtered_df.head(5))
+    except Exception as e:
+        print(f"❌ Shortlisting failed: {e}")
+        return
+    t_short = time.time() - start_short
+    print(f"⏱  Time: {t_short:.2f}s")
+
+    # 2. Main Pipeline (run on filtered holdout.csv)
+    print(f"\n[STEP 2] Main Pipeline: Feature Extraction, IP, Model (Single File)...")
+    cpu_start, gpu_start = get_stats()
+    start_pipe = time.time()
+    try:
+        df_out = await pipeline.run_pipeline(
+            holdout_folder=os.path.dirname(DATASET_PATH),
+            ps02_whitelist_file=WHITELIST_PATH,
+            limit_whitelisted=None,
+            use_existing_holdout=True
+        )
+        n_processed = len(df_out) if df_out is not None else 0
+        print(f"✅ Pipeline complete: {n_processed} records processed.")
+    except Exception as e:
+        print(f"❌ Pipeline failed: {e}")
+        return
+    t_pipe = time.time() - start_pipe
+    cpu_end, gpu_end = get_stats()
+    print(f"⏱  Time: {t_pipe:.2f}s")
+    print(f"🧠 Memory: CPU {cpu_end:.1f}% (Δ{cpu_end-cpu_start:+.1f}%), GPU {gpu_end*100:.1f}% (Δ{(gpu_end-gpu_start)*100:+.1f}%)")
+
+    # 3. Packaging
+    print(f"\n[STEP 3] Packaging Results...")
+    start_pack = time.time()
+    try:
+        zip_path = pipeline.package_results()
+        print(f"✅ Packaged results: {zip_path}")
+    except Exception as e:
+        print(f"❌ Packaging failed: {e}")
+        zip_path = None
+    t_pack = time.time() - start_pack
+    print(f"⏱  Time: {t_pack:.2f}s")
+
+    # 4. Final Summary
+    t_total = t_short + t_pipe + t_pack
+    print("\n" + "="*70)
+    print("🏆 BENCHMARK SUMMARY")
+    print("-"*70)
+    print(f"Total Time:      {t_total:.2f} seconds")
+    print(f"Shortlisting:    {t_short:.2f} s")
+    print(f"Pipeline:        {t_pipe:.2f} s")
+    print(f"Packaging:       {t_pack:.2f} s")
+    print(f"Total Samples:   {n_processed}")
+    print(f"Overall Speed:   {t_total/(n_processed if n_processed>0 else 1):.2f} s/domain")
+    print(f"Timestamp:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("="*70)
+
+    # 5. Show sample output
+    try:
+        if df_out is not None and hasattr(df_out, 'head'):
+            print("\nSample Output (first 5 rows):")
+            print(df_out.head(5))
+    except Exception:
+        pass
+
+    # 6. Cleanup
     try:
         await visual_features.close_browser_async()
-        await asyncio.sleep(2)
-    except Exception as e:
-        print(f"Error during cleanup: {e}")
-    gc.collect()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
-    # Windows loop policy
     if sys.platform.startswith("win"):
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-        
-    asyncio.run(run_benchmark())
+    try:
+        asyncio.run(run_full_pipeline_benchmark())
+    except KeyboardInterrupt:
+        print("\nBenchmark stopped by user.")
+    except Exception as e:
+        print(f"\nFatal Error: {e}")

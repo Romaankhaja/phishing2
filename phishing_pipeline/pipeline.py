@@ -132,67 +132,105 @@ def adjust_source(org_name, whitelisted_domain, ml_source="Unknown"):
 # Feature extraction
 # ------------------------------------------------------------------
 async def process_urls(input_csv, output_csv=FEATURES_CSV):
-    """Extract features for each candidate domain asynchronously."""
-    import csv
-    df = pd.read_csv(input_csv)
-    logger.info("⚙️ Extracting features for %d domains (Async)", len(df))
+    """
+    Extract features using Optimized Producer-Consumer Pipeline.
     
-    # Check for empty dataframe
+    Stage 1: Network Features (Fast, High Concurrency)
+    Stage 2: Visual Features (Slow, throttled by ResourceMonitor)
+    """
+    import csv 
+    from .resource_manager import ResourceMonitor
+    from .utils import extract_network_features_async, extract_visual_features_async
+    
+    df = pd.read_csv(input_csv)
+    logger.info("⚙️ Starting Optimized Pipeline for %d domains...", len(df))
+    
     if df.empty:
-        # Create empty file with headers
-        with open(output_csv, mode="w", newline="", encoding="utf-8") as f:
-            pass # We don't know the headers yet, but utils will handle it or next step will fail gracefully
+        with open(output_csv, mode="w", newline="", encoding="utf-8") as f: pass
         return output_csv
 
-    semaphore = asyncio.Semaphore(5) # Conservative: increased from 5 to 7 for modest improvement
+    # Initialize Resource Monitor
+    monitor = ResourceMonitor(
+        cpu_threshold=90.0, 
+        ram_threshold=85.0, 
+        gpu_threshold=90.0
+    )
+    
+    # High concurrency for network tasks
+    network_semaphore = asyncio.Semaphore(50) 
+    
+    # We will write results as they complete (Visual stage completeness determines final write)
+    # But we need to match Network results to Visual results.
+    # Approach:
+    # 1. Launch Network Task. Return partial dict.
+    # 2. Pass partial dict to Visual Task (which waits for resources).
+    # 3. Visual Task updates dict and writes to CSV.
+    
     queue = asyncio.Queue()
     
-    # Writer task
+    # Writer Task
     async def writer_task():
         with open(output_csv, mode="w", newline="", encoding="utf-8") as f:
             writer = None
             while True:
                 record = await queue.get()
-                if record is None:
-                    break
+                if record is None: break
                 
                 if writer is None:
                     writer = csv.DictWriter(f, fieldnames=list(record.keys()))
                     writer.writeheader()
                 
                 writer.writerow(record)
-                f.flush() # Ensure it's written
+                f.flush()
                 queue.task_done()
     
-    writer = asyncio.create_task(writer_task())
-    
-    async def worker(idx, row):
+    writer_handle = asyncio.create_task(writer_task())
+
+    # Pipeline Logic
+    async def process_domain(idx, row):
         domain = row["Identified Phishing/Suspected Domain Name"]
-        # logger.info("[%d] Processing %s", idx, domain) # Too noisy for async
-        try:
-            feats, _ = await extract_all_features_async(domain, semaphore)
-            record = {
-                "Cooresponding CSE": row["Cooresponding CSE"],
-                "Legitimate Domains": row["Legitimate Domains"],
-                **feats
-            }
-            await queue.put(record)
-            logger.info("✅ Extracted: %s", domain)
-        except Exception as e:
-            logger.error("❌ Failed: %s — %s", domain, e)
-            # Put partial record or just skip? 
-            # If we skip, the lineup might break if we rely on row order (we use joins later so it should be fine)
-    
-    tasks = []
-    for idx, row in df.iterrows():
-        tasks.append(asyncio.create_task(worker(idx, row)))
         
-    # Wait for all workers
+        # --- Stage 1: Network (Fast) ---
+        # No resource check needed here, just bounded concurrency via semaphore
+        try:
+            net_feats = await extract_network_features_async(domain, network_semaphore)
+        except Exception as e:
+            logger.error(f"Network stage failed for {domain}: {e}")
+            net_feats = {}
+
+        # --- Stage 2: Visual (Resource Intensive) ---
+        # Wait for resources before starting heavy GPU/Browser work
+        await monitor.wait_for_resources()
+        
+        try:
+            # We don't pass a fixed semaphore here anymore; the Monitor acts as the gatekeeper.
+            # But we might still want a safety cap (e.g., 4 concurrent browsers) inside utils.
+            vis_feats, _ = await extract_visual_features_async(domain) 
+        except Exception as e:
+            logger.error(f"Visual stage failed for {domain}: {e}")
+            vis_feats = {}
+            
+        # Merge
+        # Note: Visual feats has the final 'url' (after redirects), so it overrides network's input url
+        final_url = vis_feats.get("url", domain)
+        full_record = {
+            "Cooresponding CSE": row["Cooresponding CSE"],
+            "Legitimate Domains": row["Legitimate Domains"],
+            **net_feats,
+            **vis_feats,
+            "url": final_url 
+        }
+        
+        await queue.put(full_record)
+        logger.info(f"✅ Completed: {domain}")
+
+    # Launch all tasks
+    tasks = [asyncio.create_task(process_domain(i, r)) for i, r in df.iterrows()]
     await asyncio.gather(*tasks)
     
-    # Signal writer to stop
+    # Cleanup
     await queue.put(None)
-    await writer
+    await writer_handle
     
     return output_csv
 

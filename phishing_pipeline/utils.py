@@ -155,63 +155,78 @@ def extract_all_features(url: str, csv_file: str | None = None) -> tuple:
         # Return empty feature dict with screenshot path
         return {}, ""
 
-async def extract_all_features_async(url: str, semaphore: asyncio.Semaphore | None = None) -> tuple:
-    """
-    Async version of extract_all_features.
-    
-    Uses asyncio to parallelize I/O and threading for CPU/GPU heavy tasks.
-    Highly recommended for batch processing multiple URLs.
-    
-    Args:
-        url: Target URL to analyze
-        semaphore: Optional asyncio Semaphore to limit concurrency
-    
-    Returns:
-        Tuple of (features_dict, screenshot_path)
-    """
+async def extract_network_features_async(url: str, semaphore: asyncio.Semaphore | None = None) -> dict:
+    """Run fast network/structure features."""
     if semaphore:
         async with semaphore:
-            return await _extract_all_features_impl(url)
-    else:
-        return await _extract_all_features_impl(url)
+            return await _extract_network_impl(url)
+    return await _extract_network_impl(url)
 
+async def _extract_network_impl(url: str) -> dict:
+    loop = asyncio.get_running_loop()
+    cpu_sem = _get_cpu_semaphore()
 
-async def _extract_all_features_impl(url: str) -> tuple:
-    """
-    Implementation of async feature extraction.
+    async def run_cpu_task(func, *args):
+        async with cpu_sem:
+            return await loop.run_in_executor(None, func, *args)
+
+    # Fast tasks
+    t_ip = run_cpu_task(get_ip_address, url)
+    t_ssl = run_cpu_task(ssl_features, url)
+    t_url_feats = run_cpu_task(extract_url_features, url)
+    t_sub_feats = run_cpu_task(extract_subdomain_features, url)
+    t_pth_feats = run_cpu_task(extract_path_features, url)
+    t_ent_feats = run_cpu_task(entropy_features, url)
     
-    Args:
-        url: Target URL to analyze
+    results = await asyncio.gather(
+        t_ip, t_ssl, t_url_feats, t_sub_feats, t_pth_feats, t_ent_feats,
+        return_exceptions=True
+    )
     
-    Returns:
-        Tuple of (features_dict, screenshot_path)
-    """
+    (ip_addr, ssl_feats, url_feats, subdomain_feats, path_feats, entropy_feats) = results
+
+    # Normalize errors
+    ip_addr = ip_addr if not isinstance(ip_addr, Exception) else None
+    ssl_feats = ssl_feats if not isinstance(ssl_feats, Exception) else {"ssl_present": 0, "ssl_valid": 0, "ssl_days_to_expiry": -1, "ssl_issuer": None}
+    url_feats = url_feats if not isinstance(url_feats, Exception) else {}
+    subdomain_feats = subdomain_feats if not isinstance(subdomain_feats, Exception) else {}
+    path_feats = path_feats if not isinstance(path_feats, Exception) else {}
+    entropy_feats = entropy_feats if not isinstance(entropy_feats, Exception) else {}
+
+    return {
+        "ip_address": ip_addr,
+        **url_feats,
+        **subdomain_feats,
+        **path_feats,
+        **entropy_feats,
+        **ssl_feats
+    }
+
+async def extract_visual_features_async(url: str, semaphore: asyncio.Semaphore | None = None) -> tuple:
+    """Run slow visual features (Screenshot, OCR, Branding)."""
+    if semaphore:
+        async with semaphore:
+            return await _extract_visual_impl(url)
+    return await _extract_visual_impl(url)
+
+async def _extract_visual_impl(url: str) -> tuple:
     ensure_dirs()
-
     try:
         ext = tldextract.extract(url)
         domain_full = ".".join(part for part in [ext.domain, ext.suffix] if part) or url
         screenshot_path = os.path.join(SCREENS_DIR, f"{domain_full}.png")
 
-        # 1. Capture Screenshot (Async I/O) with semaphore
         screenshot_sem = _get_screenshot_semaphore()
         async with screenshot_sem:
             target_url, capture_ok = await capture_screenshot_async(url, screenshot_path)
 
         if not capture_ok:
-            # Create dummy image in a thread to avoid blocking loop
             await asyncio.to_thread(_create_dummy_image, url, screenshot_path)
             logger.warning("Screenshot capture failed for %s", url)
 
-        # 2. Run independent features in parallel with resource limits
         loop = asyncio.get_running_loop()
-        cpu_sem = _get_cpu_semaphore()
         ocr_sem = _get_ocr_semaphore()
         img_sem = _get_image_semaphore()
-
-        async def run_cpu_task(func, *args):
-            async with cpu_sem:
-                return await loop.run_in_executor(None, func, *args)
 
         async def run_ocr_task(func, *args):
             async with ocr_sem:
@@ -221,59 +236,52 @@ async def _extract_all_features_impl(url: str) -> tuple:
             async with img_sem:
                 return await loop.run_in_executor(None, func, *args)
 
-        t_ip = run_cpu_task(get_ip_address, target_url)
-        t_ssl = run_cpu_task(ssl_features, target_url)
-        t_url_feats = run_cpu_task(extract_url_features, target_url)
-        t_sub_feats = run_cpu_task(extract_subdomain_features, target_url)
-        t_pth_feats = run_cpu_task(extract_path_features, target_url)
-        t_ent_feats = run_cpu_task(entropy_features, target_url)
-
         t_ocr = run_ocr_task(_safe_extract_ocr, screenshot_path)
         t_brand = run_image_task(_safe_extract_branding, screenshot_path)
         t_lap = run_image_task(_safe_extract_laplacian, screenshot_path)
-
         t_fav = get_favicon_features_async(target_url)
 
-        results = await asyncio.gather(
-            t_ip, t_ssl, t_url_feats, t_sub_feats, t_pth_feats, t_ent_feats,
-            t_ocr, t_brand, t_lap, t_fav,
-            return_exceptions=True
-        )
+        results = await asyncio.gather(t_ocr, t_brand, t_lap, t_fav, return_exceptions=True)
+        (ocr_text, branding_feats, lap_var, fav_feats) = results
 
-        (ip_addr, ssl_feats, url_feats, subdomain_feats, path_feats, entropy_feats,
-         ocr_text, branding_feats, lap_var, fav_feats) = results
+        # Normalize errors
+        ocr_text = ocr_text if not isinstance(ocr_text, Exception) else ""
+        branding_feats = branding_feats if not isinstance(branding_feats, Exception) else DEFAULT_BRANDING_FEATURES
+        lap_var = lap_var if not isinstance(lap_var, Exception) else float("nan")
+        if isinstance(fav_feats, (Exception, type(None))): fav_feats = {}
+        else: fav_feats.pop("favicon_path", None)
 
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error("Task %d failed: %s", i, result)
-                if i == 0:
-                    ip_addr = None
-                elif i == 1:
-                    ssl_feats = {"ssl_present": 0, "ssl_valid": 0, "ssl_days_to_expiry": -1, "ssl_issuer": None}
-                elif i == 2:
-                    url_feats = {}
-                # ... etc for other indices
-
-        if isinstance(fav_feats, dict):
-            fav_feats.pop("favicon_path", None)
-        else:
-            fav_feats = {}
-
-        all_feats = {
-            "url": target_url,
-            "ip_address": ip_addr,
-            **(url_feats if isinstance(url_feats, dict) else {}),
-            **(subdomain_feats if isinstance(subdomain_feats, dict) else {}),
-            **(path_feats if isinstance(path_feats, dict) else {}),
-            **(entropy_feats if isinstance(entropy_feats, dict) else {}),
-            **(ssl_feats if isinstance(ssl_feats, dict) else {}),
-            **(branding_feats if isinstance(branding_feats, dict) else DEFAULT_BRANDING_FEATURES),
-            **fav_feats,
-            "ocr_text": ocr_text if isinstance(ocr_text, str) else "",
-            "laplacian_variance": lap_var if isinstance(lap_var, (int, float)) else float("nan")
+        feats = {
+            "url": target_url, # Updated URL after redirect
+            "ocr_text": ocr_text,
+            "laplacian_variance": lap_var,
+            **branding_feats,
+            **fav_feats
         }
+        return feats, screenshot_path
 
-        return all_feats, screenshot_path
+    except Exception as e:
+        logger.error("Visual extraction error for %s: %s", url, e)
+        return {}, ""
+
+# Kept for backward compatibility but calls the new split functions internally? 
+# Actually simpler to just have it call them both:
+async def extract_all_features_async(url: str, semaphore: asyncio.Semaphore | None = None) -> tuple:
+    if semaphore:
+        async with semaphore:
+             return await _extract_all_impl_combined(url)
+    return await _extract_all_impl_combined(url)
+
+async def _extract_all_impl_combined(url: str) -> tuple:
+    try:
+        # A simple join of the two new functions
+        net_feats = await _extract_network_impl(url)
+        vis_feats, screen_path = await _extract_visual_impl(url)
+        # Merge, prioritizing visual's URL if redirected
+        final_url = vis_feats.get("url", url) 
+        combined = {**net_feats, **vis_feats}
+        combined["url"] = final_url
+        return combined, screen_path
     except Exception as e:
         logger.error("Unexpected error in async feature extraction for %s: %s", url, e)
         return {}, ""
