@@ -10,8 +10,26 @@ import asyncio
 import logging
 
 # Event loop policy on Windows
+# Event loop policy on Windows
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    
+    # Silence "Event loop is closed" error on Windows
+    from functools import wraps
+    from asyncio.proactor_events import _ProactorBasePipeTransport
+    
+    def silence_event_loop_closed(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            try:
+                return func(self, *args, **kwargs)
+            except RuntimeError as e:
+                # Ignore this specific error during shutdown
+                if str(e) != 'Event loop is closed':
+                    raise
+        return wrapper
+
+    _ProactorBasePipeTransport.__del__ = silence_event_loop_closed(_ProactorBasePipeTransport.__del__)
 
 logging.basicConfig(
     level=logging.INFO,

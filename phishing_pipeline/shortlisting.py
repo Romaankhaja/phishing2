@@ -98,14 +98,20 @@ def is_similar_advanced(cand_url_norm: str, legit_url_norm: str,
 def load_urls_from_excel_folder(folder_path):
     logger.info(f"Reading Excel files from: {folder_path}")
     all_urls = set()
-    excel_files = glob.glob(os.path.join(folder_path, "*.xlsx"))
-    if not excel_files:
-        logger.warning(f"No .xlsx files found in {folder_path}.")
+    files = glob.glob(os.path.join(folder_path, "*.xlsx")) + glob.glob(os.path.join(folder_path, "*.xls"))
+    if not files:
+        logger.warning(f"No .xlsx or .xls files found in {folder_path}.")
         return all_urls
-    logger.info(f"Found {len(excel_files)} files.")
-    for file in excel_files:
+    logger.info(f"Found {len(files)} files.")
+    
+    for f in files:
+        # Ignore temporary lock files created by Excel
+        if os.path.basename(f).startswith("~$"):
+            logger.info(f"Skipping temporary Excel file: {f}")
+            continue
+            
         try:
-            df = pd.read_excel(file)
+            df = pd.read_excel(f)
             possible_cols = ["Identified Phishing/Suspected Domain Name", "URL", "url", "Domain", "domain_name"]
             found_col = None
             for col in possible_cols:
@@ -119,12 +125,12 @@ def load_urls_from_excel_folder(folder_path):
                         break
             if not found_col:
                 found_col = df.columns[0]
-                logger.warning(f"No known URL column in {file}. Using first column: {found_col}")
+                logger.warning(f"No known URL column in {f}. Using first column: {found_col}")
             urls = df[found_col].dropna().astype(str)
             all_urls.update(url.strip().lower() for url in urls)
-            logger.info(f"Loaded {len(urls)} URLs from '{file}'")
+            logger.info(f"Loaded {len(urls)} URLs from '{f}'")
         except Exception as e:
-            logger.error(f"Failed to read {file}: {e}")
+            logger.error(f"Failed to read {f}: {e}")
     return all_urls
 
 def load_urls_from_txt(file_path):

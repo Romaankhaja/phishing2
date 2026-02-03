@@ -13,7 +13,7 @@ from datetime import datetime
 from phishing_pipeline import pipeline, shortlisting, visual_features
 from phishing_pipeline.config import FINAL_OUTPUT
 
-DATASET_PATH = "PS-02_hold-out_Set_2/PS-02_hold-out_Set_2_Part_1.xlsx"
+DATASET_PATH = "PS-02_hold-out_Set_2\domains.xlsx"
 WHITELIST_PATH = "uploads/PS-02_hold-out_Set1_Legitimate_Domains_for_10_CSEs.xlsx"
 LIMIT_SAMPLES = None  # Set to None for full run, or e.g. 100 for quick test
 
@@ -56,7 +56,6 @@ async def run_full_pipeline_benchmark():
         if n_candidates == 0:
             print("❌ No data to process. Exiting benchmark before pipeline step.")
             return
-        import os
         holdout_path = os.path.abspath('holdout.csv')
         filtered_df.to_csv(holdout_path, index=False)
         print(f"holdout.csv written to: {holdout_path}")

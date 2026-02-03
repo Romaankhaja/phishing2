@@ -452,9 +452,22 @@ def extract_ocr_text(image_path: str) -> str:
         if not os.path.exists(image_path):
             logger.warning("Image file not found for OCR: %s", image_path)
             return ""
+        
+        # Optimize image for OCR to save VRAM
+        img = Image.open(image_path).convert('L') # Convert to grayscale
+        
+        # Downscale if too large (limit width to 1280px)
+        max_width = 1280
+        if img.width > max_width:
+            ratio = max_width / img.width
+            new_height = int(img.height * ratio)
+            img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
+            
+        img_np = np.array(img)
+            
         # Use the getter function to ensure the model is loaded
         reader = _get_ocr_reader()
-        results = reader.readtext(image_path, detail=0)  # detail=0 → only text
+        results = reader.readtext(img_np, detail=0)  # detail=0 → only text
         txt = " ".join(results)
         txt = re.sub(r"\s+", " ", txt).strip()
         # GPU memory cleanup after each OCR call (if using GPU)

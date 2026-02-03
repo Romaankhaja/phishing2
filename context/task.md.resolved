@@ -1,0 +1,10 @@
+- [x] User Review of Optimization Plan <!-- id: 4 -->
+- [x] Create [resource_manager.py](file:///c:/Users/SATWIK/Documents/Phishing/phishing_pipeline/resource_manager.py) for system monitoring <!-- id: 4.5 -->
+- [x] Refactor [pipeline.py](file:///c:/Users/SATWIK/Documents/Phishing/phishing_pipeline/pipeline.py) for producer-consumer model <!-- id: 5 -->
+    - [x] Integrate [ResourceMonitor](file:///c:/Users/SATWIK/Documents/Phishing/phishing_pipeline/resource_manager.py#8-60) into consumer loop <!-- id: 5.5 -->
+    - [x] Split processing loop into Network vs Visual stages <!-- id: 6 -->
+    - [x] Implement merging logic <!-- id: 7 -->
+- [x] Refactor [utils.py](file:///c:/Users/SATWIK/Documents/Phishing/phishing_pipeline/utils.py) to support decoupled execution <!-- id: 8 -->
+- [x] Verify GPU usage and benchmark speed <!-- id: 9 -->
+- [x] Final Verification of all changes <!-- id: 10 -->
+- [x] Create detailed GPU Utilization Report for user <!-- id: 11 -->

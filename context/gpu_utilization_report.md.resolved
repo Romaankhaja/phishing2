@@ -1,0 +1,51 @@
+# GPU Utilization Report
+
+## Executive Summary
+Your pipeline is **already optimized** to use the GPU exactly where it provides a speed benefit. Using the GPU for *all* tasks would actually **slow down** the pipeline significantly.
+
+The GPU (Graphics Processing Unit) is a specialized chip designed for **massive parallel matrix math** (like rendering graphics or running AI models). It is NOT designed for sequential tasks like waiting for a network response or parsing a text string.
+
+## Task Breakdown
+
+### 1. Visual & AI Tasks (✅ GPU Accelerated)
+**Status:** Running on RTX 2050
+These tasks involve processing millions of pixels or running neural networks.
+*   **OCR (Text Extraction):** Uses EasyOCR (PyTorch). This involves complex matrix multiplications to recognize characters from pixel data.
+*   **Image Hashing/Comparison:** Some image processing steps (like finding brand logos) can leverage GPU acceleration if using deep learning libraries.
+
+**Why GPU?** A CPU might take 2-3 seconds per image. A GPU does it in 0.1 seconds.
+
+### 2. Network Tasks (❌ CPU/IO Only)
+**Status:** Running on CPU (Network Interface)
+These tasks involve sending a request and **waiting** for a server to reply.
+*   **DNS Lookups:** Asking a DNS server for an IP.
+*   **SSL Handshakes:** Verifying security certificates.
+*   **Whois:** Querying a registrar database.
+*   **Page Navigation (Playwright):** The browser logic itself runs on CPU; only the rendering (painting pixels) uses GPU.
+
+**Why NOT GPU?** You cannot "calculate" a network response faster with a GPU. The bottleneck is the speed of light (internet latency), not calculation speed. The GPU would sit 99% idle waiting for the packet to return.
+
+### 3. Structural Tasks (❌ CPU Only)
+**Status:** Running on CPU
+These tasks involve simple text manipulation.
+*   **URL Features:** Counting dots, checking length, finding substrings.
+*   **Entropy Calculation:** Basic math on a short string.
+
+**Why NOT GPU?**
+*   **Overhead:** To run this on a GPU, you must:
+    1.  Copy the string from System RAM → GPU VRAM (Slow).
+    2.  Run the tiny calculation (Fast).
+    3.  Copy the result from GPU VRAM → System RAM (Slow).
+*   **Result:** The "copying" takes longer than the actual work. The CPU can do it instantly in its own cache.
+
+## Optimization Strategy
+Your current pipeline uses the **Hybrid Approach**, which is the industry standard for high-performance computing:
+
+| Component | Hardware | Reason |
+| :--- | :--- | :--- |
+| **Network Manager** | **CPU** (AsyncIO) | Handles 1000s of waiting connections cheaply. |
+| **Feature Extraction** | **CPU** (Fast) | string/math ops are too small for GPU. |
+| **Computer Vision** | **GPU** (RTX 2050) | Heavy matrix math requires massive parallelism. |
+
+## Conclusion
+Your system is correctly configured. You are seeing 100% GPU usage during OCR bursts because that is the only part of the code math-heavy enough to saturate it. If we forced network or string tasks onto the GPU, the pipeline would become **slower** due to memory transfer overhead.

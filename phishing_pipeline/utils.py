@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # ================== RESOURCE MANAGEMENT SEMAPHORES ==================
 # These semaphores limit concurrent operations to prevent memory exhaustion
 # Tuned for RTX 2050 with 2GB VRAM
-MAX_CONCURRENT_OCR = 2
+MAX_CONCURRENT_OCR = 1
 MAX_CONCURRENT_SCREENSHOTS = 8
 MAX_CONCURRENT_IMAGE_PROCESSING = 5
 MAX_CONCURRENT_CPU_TASKS = 20

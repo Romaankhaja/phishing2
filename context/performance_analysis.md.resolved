@@ -1,0 +1,222 @@
+# Performance Analysis: Phishing Pipeline Benchmark
+
+## Current Performance
+- **Time per domain**: ~5.44 seconds
+- **Total time for 5 domains**: 27.21 seconds
+- **Status**: ✅ Benchmark completed successfully (exceptions are harmless cleanup warnings)
+
+---
+
+## Primary Bottlenecks
+
+### 1. **Screenshot Capture Timeout** ⏱️
+**Location**: [visual_features.py:L192](file:///c:/Users/SATWIK/Documents/Phishing/phishing_pipeline/visual_features.py#L192)
+
+```python
+await page.goto(target, timeout=10000)  # 10-second timeout
+```
+
+**Impact**: Each domain can take up to 10 seconds just for page load
+- Even fast-loading sites consume 2-4 seconds for rendering
+- Full-page screenshots add additional overhead
+- Playwright needs time to wait for network idle, images, etc.
+
+**Recommendation**:
+- Reduce timeout to 5000ms (5 seconds) for faster failures
+- Use `wait_until='domcontentloaded'` instead of default `'load'` event
+- Consider viewport screenshots instead of full-page
+
+---
+
+### 2. **EasyOCR Processing** 🔍
+**Location**: [visual_features.py:L323-334](file:///c:/Users/SATWIK/Documents/Phishing/phishing_pipeline/visual_features.py#L323-334)
+
+```python
+reader = _get_ocr_reader()
+results = reader.readtext(image_path, detail=0)
+```
+
+**Impact**: OCR on full-page screenshots is CPU/GPU intensive
+- First call loads the EasyOCR model (~1-2 seconds)
+- Each subsequent OCR operation: 1-3 seconds per image
+- Full-page screenshots are large, increasing processing time
+
+**Recommendation**:
+- Process only the top portion of screenshots (first 1000-2000px)
+- Use lower resolution for OCR (resize images before processing)
+- Consider batch processing if EasyOCR supports it
+- Verify GPU is actually being used (check CUDA availability)
+
+---
+
+### 3. **Concurrency Limiting** 🚦
+**Location**: [pipeline.py:L148](file:///c:/Users/SATWIK/Documents/Phishing/phishing_pipeline/pipeline.py#L148)
+
+```python
+semaphore = asyncio.Semaphore(5)  # Only 5 concurrent operations
+```
+
+**Impact**: Limits parallel processing to prevent overwhelming the system
+- Good for stability but reduces throughput
+- With 5 domains and semaphore=5, they run in parallel but still bottlenecked by slowest operation
+
+**Recommendation**:
+- Increase to 10-15 for better throughput (monitor system resources)
+- Separate semaphores for different operation types:
+  - Higher limit for lightweight operations (DNS, WHOIS)
+  - Lower limit for heavy operations (screenshots, OCR)
+
+---
+
+### 4. **Sequential Browser Operations** 🌐
+**Location**: [visual_features.py:L179-201](file:///c:/Users/SATWIK/Documents/Phishing/phishing_pipeline/visual_features.py#L179-201)
+
+**Impact**: Even with async, browser operations have inherent delays
+- Creating new pages
+- Navigating to URLs
+- Waiting for rendering
+- Taking screenshots
+- Closing pages
+
+**Recommendation**:
+- Reuse browser pages instead of creating new ones each time
+- Implement page pooling (create 5-10 pages upfront, reuse them)
+- Consider using multiple browser contexts for better isolation
+
+---
+
+## AsyncIO Exceptions Explained
+
+### The `RuntimeError: Event loop is closed` Warnings
+
+```
+Exception ignored in: <function BaseSubprocessTransport.__del__ at ...>
+RuntimeError: Event loop is closed
+```
+
+**Status**: ⚠️ **Harmless cleanup warnings** - not actual errors
+
+**Cause**:
+- Playwright uses subprocesses to control the browser
+- On Windows, when the script exits, asyncio closes the event loop
+- Subprocess cleanup tries to use the closed loop
+- This is a known Windows + asyncio + subprocess timing issue
+
+**Why it happens**:
+1. Your benchmark completes successfully
+2. `asyncio.run()` closes the event loop
+3. Playwright subprocess destructors try to clean up pipes
+4. The event loop is already closed → warning is logged
+5. Python's garbage collector eventually cleans everything up
+
+**Impact**: None - your benchmark completed successfully and produced correct output
+
+**Fix** (optional, for cleaner output):
+```python
+# In benchmark.py, add more aggressive cleanup
+async def run_benchmark():
+    # ... existing code ...
+    
+    # Enhanced cleanup
+    try:
+        await visual_features.close_browser_async()
+        await asyncio.sleep(2)  # Give more time for cleanup
+    except Exception as e:
+        print(f"Error during cleanup: {e}")
+    
+    # Force garbage collection
+    import gc
+    gc.collect()
+```
+
+---
+
+## Optimization Recommendations (Prioritized)
+
+### 🔥 **Quick Wins** (Implement First)
+
+1. **Reduce Screenshot Timeout**
+   ```python
+   # In visual_features.py:L192
+   await page.goto(target, timeout=5000, wait_until='domcontentloaded')
+   ```
+   **Expected gain**: 2-3 seconds per slow/failing domain
+
+2. **Crop Screenshots Before OCR**
+   ```python
+   # In utils.py, before OCR processing
+   def _safe_extract_ocr(screenshot_path):
+       # Crop to top 2000px before OCR
+       img = Image.open(screenshot_path)
+       cropped = img.crop((0, 0, img.width, min(2000, img.height)))
+       temp_path = screenshot_path.replace('.png', '_cropped.png')
+       cropped.save(temp_path)
+       result = extract_ocr_text(temp_path)
+       os.remove(temp_path)
+       return result
+   ```
+   **Expected gain**: 1-2 seconds per domain
+
+3. **Increase Semaphore Limit**
+   ```python
+   # In pipeline.py:L148
+   semaphore = asyncio.Semaphore(10)  # Increase from 5 to 10
+   ```
+   **Expected gain**: Better parallelization, 20-30% overall speedup
+
+### 🎯 **Medium Effort** (High Impact)
+
+4. **Implement Page Pooling**
+   - Create a pool of 10 browser pages upfront
+   - Reuse pages instead of creating/closing each time
+   - **Expected gain**: 30-40% speedup
+
+5. **Optimize OCR Resolution**
+   - Resize images to 50% before OCR
+   - EasyOCR still works well at lower resolutions
+   - **Expected gain**: 40-50% faster OCR
+
+6. **Verify GPU Usage**
+   ```python
+   # Check if EasyOCR is using GPU
+   import torch
+   print(f"CUDA available: {torch.cuda.is_available()}")
+   print(f"CUDA device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None'}")
+   ```
+
+### 🚀 **Advanced** (Requires More Work)
+
+7. **Separate Semaphores by Operation Type**
+   ```python
+   screenshot_sem = asyncio.Semaphore(5)   # Heavy operations
+   network_sem = asyncio.Semaphore(20)     # Lightweight operations
+   ```
+
+8. **Implement Caching**
+   - Cache DNS lookups, WHOIS data
+   - Skip re-processing if domain was recently processed
+
+9. **Use Headless Browser Alternatives**
+   - Consider using `requests` + `BeautifulSoup` for simple pages
+   - Only use Playwright for complex JavaScript-heavy sites
+
+---
+
+## Expected Performance After Optimizations
+
+| Optimization Level | Time per Domain | Total Time (5 domains) | Speedup |
+|-------------------|----------------|------------------------|---------|
+| **Current** | 5.44s | 27.21s | Baseline |
+| **Quick Wins** | 3.0-3.5s | 15-17s | **1.8x faster** |
+| **+ Medium Effort** | 2.0-2.5s | 10-12s | **2.5x faster** |
+| **+ Advanced** | 1.5-2.0s | 7-10s | **3.5x faster** |
+
+---
+
+## Next Steps
+
+1. ✅ Implement quick wins (timeout reduction, semaphore increase)
+2. ✅ Verify GPU is being used for OCR
+3. ✅ Test with cropped screenshots for OCR
+4. ⏳ Measure performance after each change
+5. ⏳ Consider page pooling if further optimization needed
