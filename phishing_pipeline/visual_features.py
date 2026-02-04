@@ -1,4 +1,4 @@
-import os, re, base64, mimetypes, requests
+import os, re, base64, mimetypes, requests, asyncio
 import numpy as np, cv2, imagehash
 from PIL import Image
 from urllib.parse import urlparse
@@ -19,14 +19,12 @@ from .config import SCREENS_DIR
 # We initialize these to None. They will be created on-demand
 # by the getter functions below, ensuring they only load when used.
 
+
 _play: Playwright | None = None
 _browser: Browser | None = None
 _context: BrowserContext | None = None
 
-_async_play: AsyncPlaywright | None = None
-_async_browser: AsyncBrowser | None = None
-_async_context: AsyncBrowserContext | None = None
-
+# _async_* variables are now handled by AsyncBrowserManager class
 _ocr_reader: easyocr.Reader | None = None
 
 logger = logging.getLogger(__name__)
@@ -66,36 +64,6 @@ def _get_browser_context() -> BrowserContext:
         logger.error("❌ Failed to initialize Playwright browser: %s", e)
         raise RuntimeError(f"Playwright initialization failed: {e}") from e
 
-async def _get_async_browser_context() -> AsyncBrowserContext:
-    """
-    Initializes and returns a single, shared Async Playwright browser context.
-    
-    Returns:
-        Async Playwright BrowserContext instance
-    
-    Raises:
-        RuntimeError: If Playwright initialization fails
-    """
-    global _async_play, _async_browser, _async_context
-    
-    if _async_context:
-        return _async_context
-
-    try:
-        logger.info("🚀 Initializing Async Playwright browser...")
-        _async_play = await async_playwright().start()
-        _async_browser = await _async_play.chromium.launch(headless=True)
-        _default_viewport = {"width": 1280, "height": 900}
-        _async_context = await _async_browser.new_context(viewport=_default_viewport)
-        logger.info("✅ Async Playwright browser context is ready.")
-        return _async_context
-    
-    except ImportError as e:
-        logger.error("❌ Playwright not installed: %s", e)
-        raise RuntimeError("Playwright library required for async screenshot capture") from e
-    except Exception as e:
-        logger.error("❌ Failed to initialize Async Playwright browser: %s", e)
-        raise RuntimeError(f"Async Playwright initialization failed: {e}") from e
 
 
 def _get_ocr_reader() -> easyocr.Reader:
@@ -160,32 +128,86 @@ def close_browser():
     
     logger.info("💤 Playwright browser has been closed.")
 
+
+# ------------------ Robust Browser Manager ------------------
+
+class AsyncBrowserManager:
+    """
+    Manages the lifecycle of the Async Playwright browser to prevent
+    'Context closed' errors. Auto-restarts if the browser crashes.
+    """
+    def __init__(self):
+        self._play = None
+        self._browser = None
+        self._context = None
+        self._lock = asyncio.Lock()
+        
+    async def get_context(self) -> AsyncBrowserContext:
+        """
+        Returns a valid, open browser context. 
+        Restarts the browser if the current context is closed or missing.
+        """
+        async with self._lock:
+            # Check if current context exists and is open
+            if self._context:
+                try:
+                    # There is no direct .is_closed() on AsyncBrowserContext in all versions, 
+                    # but if browser is connected, context is likely fine.
+                    if self._browser and self._browser.is_connected():
+                        return self._context
+                except Exception:
+                    pass
+                
+                logger.warning("⚠️ Found closed or disconnected browser context. Restarting...")
+                await self._force_close()
+
+            # Initialize new one
+            return await self._start_new_session()
+
+    async def _start_new_session(self) -> AsyncBrowserContext:
+        """Internal method to launch a fresh Playwright session."""
+        try:
+            logger.info("🚀 Launching new Async Playwright session...")
+            self._play = await async_playwright().start()
+            self._browser = await self._play.chromium.launch(headless=True)
+            self._context = await self._browser.new_context(viewport={"width": 1280, "height": 900})
+            logger.info("✅ New Async Browser Context Ready.")
+            return self._context
+        except Exception as e:
+            logger.error("❌ Failed to start browser session: %s", e)
+            raise
+
+    async def _force_close(self):
+        """Aggressively cleans up resources."""
+        if self._context:
+            try:
+                await self._context.close()
+            except Exception: pass
+        if self._browser:
+            try:
+                await self._browser.close()
+            except Exception: pass
+        if self._play:
+            try:
+                await self._play.stop()
+            except Exception: pass
+        
+        self._context = None
+        self._browser = None
+        self._play = None
+
+    async def close(self):
+        """Graceful shutdown at end of script."""
+        async with self._lock:
+            await self._force_close()
+            logger.info("💤 Async Browser Manager shutdown complete.")
+
+# Singleton instance
+_async_browser_manager = AsyncBrowserManager()
+
 async def close_browser_async():
-    """Cleanly close async browser + context when done."""
-    global _async_play, _async_browser, _async_context
-    
-    if _async_context:
-        try:
-            await _async_context.close()
-            _async_context = None
-        except Exception as e:
-            logger.warning("Error closing Async Playwright context: %s", e)
-            
-    if _async_browser:
-        try:
-            await _async_browser.close()
-            _async_browser = None
-        except Exception as e:
-            logger.warning("Error closing Async Playwright browser: %s", e)
-            
-    if _async_play:
-        try:
-            await _async_play.stop()
-            _async_play = None
-        except Exception as e:
-            logger.warning("Error stopping Async Playwright: %s", e)
-    
-    logger.info("💤 Async Playwright browser has been closed.")
+    """Wrapper to close the singleton manager."""
+    await _async_browser_manager.close()
 
 # ------------------ Screenshot ------------------
 def capture_screenshot(url: str, out_file: str, width: int = 1280, height: int = 900) -> tuple[str, bool]:
@@ -231,46 +253,55 @@ def capture_screenshot(url: str, out_file: str, width: int = 1280, height: int =
 
 async def capture_screenshot_async(url: str, out_file: str, width: int = 1280, height: int = 900) -> tuple[str, bool]:
     """
-    Capture screenshot asynchronously using Playwright.
-    
-    Optimized for batching multiple URLs concurrently.
-    
-    Args:
-        url: Target URL to capture
-        out_file: Output file path for screenshot
-        width: Viewport width (default 1280)
-        height: Viewport height (default 900)
-    
-    Returns:
-        Tuple of (normalized_url, success_flag)
+    Capture screenshot asynchronously with automatic retry and browser recovery.
     """
-    try:
-        if not url.startswith("http"):
-            try_urls = [f"https://{url}", f"http://{url}"]
-        else:
-            try_urls = [url]
+    if not url.startswith("http"):
+        try_urls = [f"https://{url}", f"http://{url}"]
+    else:
+        try_urls = [url]
 
-        context = await _get_async_browser_context()
-        page = await context.new_page()
-        
-        for target in try_urls:
-            try:
-                # Optimized: reduced timeout to 5s and use domcontentloaded for faster loading
-                await page.goto(target, timeout=5000, wait_until='domcontentloaded')
-                await page.screenshot(path=out_file, full_page=True)
-                await page.close()
-                return target, True
-            except Exception as nav_error:
-                logger.debug("Navigation to %s failed: %s", target, nav_error)
-                continue
-        
-        await page.close()
-        logger.warning("Failed to capture screenshot for %s", url)
-        return try_urls[-1], False
+    # Retry logic for the entire operation (in case browser crashes mid-op)
+    MAX_RETRIES = 2
+    for attempt in range(MAX_RETRIES):
+        try:
+            # 1. Get a healthy context from the manager
+            context = await _async_browser_manager.get_context()
+            
+            # 2. Create page
+            page = await context.new_page()
+            
+            # 3. Try URLs
+            for target in try_urls:
+                try:
+                    await page.goto(target, timeout=5000, wait_until='domcontentloaded')
+                    await page.screenshot(path=out_file, full_page=True)
+                    await page.close()
+                    return target, True
+                except Exception as nav_error:
+                    # If it's a "Target closed" error, it might be the browser dying
+                    if "closed" in str(nav_error).lower() or "context" in str(nav_error).lower():
+                        raise nav_error # Re-raise to trigger the outer retry loop
+                    logger.debug(f"Attempt {attempt}: Nav failed for {target}: {nav_error}")
+                    continue
+            
+            await page.close()
+            return try_urls[-1], False
+
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "closed" in err_msg or "context" in err_msg:
+                if attempt < MAX_RETRIES - 1:
+                    logger.warning(f"⚠️ Browser context died capturing {url}. Restarting and retrying... (Attempt {attempt+1})")
+                    # Force restart the browser for the next loop
+                    await _async_browser_manager._force_close()
+                    await asyncio.sleep(1) # Breathe
+                    continue
+            
+            logger.error(f"❌ Async screenshot error for {url}: {e}")
+            return url, False
     
-    except Exception as e:
-        logger.error("Async screenshot capture error for %s: %s", url, e)
-        return url, False
+    return url, False
+
 
 
 # ------------------ Brand Colors ------------------
@@ -373,7 +404,7 @@ def _save_favicon_from_data_url(data_url, dst_basename):
 async def detect_favicon_async(domain_or_url):
     url = domain_or_url if domain_or_url.startswith("http") else "https://" + domain_or_url
     try:
-        context = await _get_async_browser_context()
+        context = await _async_browser_manager.get_context()
         page = await context.new_page()
         
         await page.goto(url, timeout=5000)
