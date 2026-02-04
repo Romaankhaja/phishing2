@@ -401,6 +401,7 @@ The GPU (Graphics Processing Unit) is a specialized chip designed for **massive 
 
 **Status:** Running on RTX 2050
 These tasks involve processing millions of pixels or running neural networks.
+
 - **OCR (Text Extraction):** Uses EasyOCR (PyTorch). This involves complex matrix multiplications to recognize characters from pixel data.
 - **Image Hashing/Comparison:** Some image processing steps (like finding brand logos) can leverage GPU acceleration if using deep learning libraries.
 
@@ -410,6 +411,7 @@ These tasks involve processing millions of pixels or running neural networks.
 
 **Status:** Running on CPU (Network Interface)
 These tasks involve sending a request and **waiting** for a server to reply.
+
 - **DNS Lookups:** Asking a DNS server for an IP.
 - **SSL Handshakes:** Verifying security certificates.
 - **Whois:** Querying a registrar database.
@@ -421,10 +423,12 @@ These tasks involve sending a request and **waiting** for a server to reply.
 
 **Status:** Running on CPU
 These tasks involve simple text manipulation.
+
 - **URL Features:** Counting dots, checking length, finding substrings.
 - **Entropy Calculation:** Basic math on a short string.
 
 **Why NOT GPU?**
+
 - **Overhead:** To run this on a GPU, you must:
     1. Copy the string from System RAM → GPU VRAM (Slow).
     2. Run the tiny calculation (Fast).
@@ -1237,6 +1241,7 @@ This document outlines strategies to optimize the `extract_ocr_text` method in t
 ## 1. Multi-Stage OCR Filtering (Early Exit)
 
 Currently, every screenshot is processed by the heavy EasyOCR model.
+
 - **Strategy:** Use a lightweight "Text Presence Detection" stage.
 - **Implementation:** Before running OCR, use OpenCV's **Edge Detection (Canny)** or **MSER (Maximally Stable Extremal Regions)** to check if the image even contains text-like patterns.
 - **Benefit:** Skips OCR entirely for pages with only graphics or empty layouts, saving CPU/GPU cycles.
@@ -1244,6 +1249,7 @@ Currently, every screenshot is processed by the heavy EasyOCR model.
 ## 2. Region of Interest (ROI) Cropping
 
 Processing a full 1280x900 image is inefficient as phishers usually place brand names and login fields in predictable locations.
+
 - **Strategy:** Crop the image to critical zones before OCR.
 - **Proposed Zones:**
     1. **Header (Top 200px):** For brand names and logos.
@@ -1253,6 +1259,7 @@ Processing a full 1280x900 image is inefficient as phishers usually place brand 
 ## 3. Hardware & Model Fine-Tuning
 
 Leverage the RTX 2050 architecture more effectively.
+
 - **Strategy A: Half-Precision (FP16):** Ensure EasyOCR is running in FP16 mode. RTX series "Tensor Cores" are optimized for 16-bit math, which can double throughput compared to FP32.
 - **Strategy B: Batch Inference:** Modify `extract_all_features_async` to collect multiple images and pass them as a list to the OCR reader. Processing 4 images at once is faster than 4 sequential calls.
 - **Strategy C: Model Selection:** EasyOCR allows choosing between different detection (CRAFT) and recognition models. Switching to a "slim" model can reduce VRAM footprint.
@@ -1260,12 +1267,14 @@ Leverage the RTX 2050 architecture more effectively.
 ## 4. Image Pre-processing for Accuracy
 
 High accuracy at lower resolutions saves time.
+
 - **Technique:** Apply **Bilateral Filtering** to remove noise followed by **Adaptive Thresholding** (converting to binary B&W).
 - **Benefit:** Simplifies the image background, making it easier for the neural network to "see" characters without needing high-complexity sampling.
 
 ## 5. Parallel Pipeline Restructuring
 
-* **Strategy:** Move OCR to a separate dedicated worker process or a "low-priority" queue.
+- **Strategy:** Move OCR to a separate dedicated worker process or a "low-priority" queue.
+
 - **Logic:** URL features (instant) and GeoIP (fast) can be processed first to provide an "Immediate Risk Score." The visual/OCR data can then be used to confirm or upgrade the risk level.
 
 ---
@@ -1286,19 +1295,22 @@ The following strategies focus on making the Playwright-based screenshot capture
 ### A. Resource Interception & Filtering
 
 Phishing detection mainly needs the visual layout of the page, not heavy media or tracking scripts.
+
 - **Strategy:** Block requests for ads, trackers, videos, and heavy fonts.
 - **Implementation:** Use `page.route("**/*")` to abort requests for irrelevant MIME types (e.g., `application/font-woff`, `video/*`, `image/gif`).
 - **Benefit:** Reduces memory usage by 40-50% and speeds up page loading significantly.
 
 ### B. Intelligent Viewport Scaling
 
-* **Strategy:** Capture at a lower `deviceScaleFactor` (e.g., 1.0 instead of 2.0).
+- **Strategy:** Capture at a lower `deviceScaleFactor` (e.g., 1.0 instead of 2.0).
+
 - **Implementation:** Set `viewport={"width": 1280, "height": 800}` but use a lower DPI setting.
 - **Benefit:** Dramatically reduces the RAM required to store the pixel buffer and the resulting file size.
 
 ### C. Chromium Flags for Headless Efficiency
 
-* **Strategy:** Pass specific startup flags to the Chromium instance.
+- **Strategy:** Pass specific startup flags to the Chromium instance.
+
 - **Proposed Flags:**
   - `--disable-dev-shm-usage`: Prevents `/dev/shm` memory exhaustion in container/small environments.
   - `--js-flags="--max-old-space-size=512"`: Limits the JavaScript engine's memory usage.
@@ -1306,11 +1318,116 @@ Phishing detection mainly needs the visual layout of the page, not heavy media o
 
 ### D. Navigation Wait Optimizations
 
-* **Strategy:** Switch from `networkidle` to `domcontentloaded`.
+- **Strategy:** Switch from `networkidle` to `domcontentloaded`.
+
 - **Implementation:** Phishers often use slow-loading external scripts to hide. Waiting for the full network to be idle is a waste of time.
 - **Benefit:** Capture occurs as soon as the HTML structure is ready, often saving 2-3 seconds per URL.
 
 ### E. Global Browser Context Pooling
 
-* **Strategy:** Reuse the same browser context for groups of 10-20 URLs before "refreshing."
+- **Strategy:** Reuse the same browser context for groups of 10-20 URLs before "refreshing."
+
 - **Benefit:** Balancing memory leaks (which happen in long-running browsers) with the overhead of creating new sessions.
+
+---
+---
+
+## 8. Browser Lifecycle Fix Plan
+
+*(Source: `implementation_plan.md.resolved`)*
+
+# Browser Lifecycle Fix Plan
+
+## Problem
+
+The error `BrowserContext.new_page: Target page, context or browser has been closed` occurs because:
+
+1. A single shared browser context (`_async_context`) is used for all concurrent tasks.
+2. If one task encounters a critical error or the browser crashes, the context is invalidated.
+3. Subsequent tasks try to use the now-closed context, leading to the error.
+
+## Proposed Solution: Robust Lifecycle Manager
+
+We will refactor `visual_features.py` to replace the simple global variables with a robust `BrowserLifecycleManager` class.
+
+### Key Changes
+
+1. **Context Pooling (Optional but recommended)**: Instead of one global context, use a small pool or recreate contexts on demand if they fail. For now, we'll stick to a **resilient singleton** pattern: if the context is closed, automatically create a new one.
+2. **Automatic Recovery**: Wrap `new_page()` calls in a retry loop. If `new_page()` fails because the browser is closed, restart the browser and try again.
+3. **Explicit Health Checks**: Before using a context, check if `context.is_closed()`.
+
+## Implementation Steps
+
+### 1. Modify `visual_features.py`
+
+#### A. Create `BrowserManager` Class
+
+Encapsulate the complexity of `playwright.start()`, `browser.launch()`, and `context.new_page()`.
+
+```python
+class AsyncBrowserManager:
+    def __init__(self):
+        self._play = None
+        self._browser = None
+        self._context = None
+        self._lock = asyncio.Lock()
+
+    async def get_context(self):
+        async with self._lock:
+            if self._context and not self._context.is_closed(): # Check if alive
+                return self._context
+            
+            # If dead or not started, (re)start
+            await self._restart_browser()
+            return self._context
+
+    async def _restart_browser(self):
+        # ... cleanup old resources ...
+        # ... start new playwright/browser/context ...
+```
+
+#### B. Update `capture_screenshot_async`
+
+Use the manager to get a fresh page.
+
+```python
+async def capture_screenshot_async(...):
+    manager = get_async_browser_manager() # Singleton accessor
+    
+    for attempt in range(max_retries):
+        try:
+            context = await manager.get_context()
+            page = await context.new_page()
+            # ... do work ...
+            return
+        except TargetClosedError:
+             # Retry logic
+```
+
+### 2. Modify `main_controller.py`
+
+Ensure the manager is properly closed at the end of the script.
+
+## Verification
+
+- Run a small batch of domains to verify stability.
+- deliberately kill chrome process during run (simulation) to test recovery.
+
+---
+---
+
+## 9. Progress Bar Implementation
+
+I've added a comprehensive progress bar to the pipeline using the `tqdm` library. This provides real-time feedback on the terminal regarding the progress of URL processing.
+
+### Features
+
+- **Percentage complete**: A visual bar indicating the overall completion percentage.
+- **Completed/Total URLs**: Clear counters showing how many domains have been processed out of the total batch (e.g., 50/177).
+- **Elapsed time**: Tracks how long the current pipeline run has been active.
+- **Remaining time (ETA)**: Calculates the estimated time to completion based on current processing speed.
+- **Processing rate**: Shows the throughput in domains per second.
+
+### Implementation Details
+
+The progress bar is integrated into the `process_urls` function in `pipeline.py`. It uses an asynchronous tracking task that monitors the status of the `asyncio` domain processing tasks and updates the `tqdm` display every 0.5 seconds.

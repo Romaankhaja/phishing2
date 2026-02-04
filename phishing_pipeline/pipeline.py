@@ -1,6 +1,7 @@
 import sys, asyncio, re, os, socket, whois, dns.resolver, logging
 import pandas as pd
 import tldextract
+from tqdm.asyncio import tqdm
 from datetime import datetime
 from dateutil import parser
 import warnings
@@ -131,7 +132,7 @@ def adjust_source(org_name, whitelisted_domain, ml_source="Unknown"):
 # ------------------------------------------------------------------
 # Feature extraction
 # ------------------------------------------------------------------
-async def process_urls(input_csv, output_csv=FEATURES_CSV):
+async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=None, whois_semaphore=None):
     """
     Extract features using Optimized Producer-Consumer Pipeline.
     
@@ -156,8 +157,11 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV):
         gpu_threshold=90.0
     )
     
-    # High concurrency for network tasks
-    network_semaphore = asyncio.Semaphore(50) 
+    # Use provided semaphores or create new ones if not passed
+    if network_semaphore is None:
+        network_semaphore = asyncio.Semaphore(50)
+    if whois_semaphore is None:
+        whois_semaphore = asyncio.Semaphore(2) 
     
     # We will write results as they complete (Visual stage completeness determines final write)
     # But we need to match Network results to Visual results.
@@ -224,9 +228,27 @@ async def process_urls(input_csv, output_csv=FEATURES_CSV):
         await queue.put(full_record)
         logger.info(f"✅ Completed: {domain}")
 
-    # Launch all tasks
+    # Launch all tasks with progress bar
     tasks = [asyncio.create_task(process_domain(i, r)) for i, r in df.iterrows()]
-    await asyncio.gather(*tasks)
+    
+    # Progress bar: shows percentage, completed/total, and ETA
+    with tqdm(total=len(df), desc="Processing URLs", unit="domain", 
+              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
+        
+        async def track_progress():
+            completed = 0
+            while completed < len(tasks):
+                await asyncio.sleep(0.5)  # Check every 0.5 seconds
+                done_count = sum(1 for t in tasks if t.done())
+                if done_count > completed:
+                    pbar.update(done_count - completed)
+                    completed = done_count
+        
+        # Run tasks and progress tracker concurrently
+        await asyncio.gather(
+            asyncio.gather(*tasks),
+            track_progress()
+        )
     
     # Cleanup
     await queue.put(None)
@@ -338,6 +360,10 @@ def reclassify_label(domain, registrar, host, dns, ocr_text_from_csv):
 async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=None, use_existing_holdout=False):
     logger.info("🚀 Starting pipeline...")
     
+    # Initialize semaphores here to be shared with process_urls
+    network_semaphore = asyncio.Semaphore(50)
+    whois_semaphore = asyncio.Semaphore(2)
+    
     # ROOT_DIR is now defined at the top of the file
     
     # --- This is your new output file ---
@@ -373,7 +399,7 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
     temp_csv_path = os.path.join(os.path.dirname(__file__), "holdout_temp.csv")
     df_filtered.to_csv(temp_csv_path, index=False, encoding="utf-8")
     
-    await process_urls(temp_csv_path, FEATURES_CSV)
+    await process_urls(temp_csv_path, FEATURES_CSV, network_semaphore, whois_semaphore)
     df_features = pd.read_csv(FEATURES_CSV)
     df_features = enrich_with_geoip(df_features, ASN_DB_PATH, CITY_DB_PATH)
     df_features.to_csv(FEATURES_ENRICH, index=False, encoding="utf-8")
@@ -431,28 +457,31 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
         hosting_isp = "NA"
         hosting_country = "NA"
         
-        # --- WHOIS lookup ---
-        try:
-            w = whois.whois(host)
-            if w:
-                creation_date = w.creation_date
-                if isinstance(creation_date, list):
-                    creation_date = creation_date[0]
-                
-                # Only overwrite "NA" if the value is not empty
-                if creation_date:
-                    reg_date = str(creation_date)
-                if w.registrar:
-                    registrar = w.registrar
-                if w.name or w.org or w.registrant_name:
-                    registrant_name = w.name or w.org or w.registrant_name
-                if w.country:
-                    registrant_country = w.country
-                if w.name_servers:
-                    ns_list = [str(ns) for ns in w.name_servers]
-                    name_servers = ";".join(ns_list)
-        except Exception as e:
-            logger.debug("WHOIS lookup failed for %s: %s", host, e)
+        # --- WHOIS lookup (rate-limited) ---
+        async with whois_semaphore:
+            try:
+                # Run blocking whois call in executor to avoid blocking event loop
+                loop = asyncio.get_running_loop()
+                w = await loop.run_in_executor(None, whois.whois, host)
+                if w:
+                    creation_date = w.creation_date
+                    if isinstance(creation_date, list):
+                        creation_date = creation_date[0]
+                    
+                    # Only overwrite "NA" if the value is not empty
+                    if creation_date:
+                        reg_date = str(creation_date)
+                    if w.registrar:
+                        registrar = w.registrar
+                    if w.name or w.org or w.registrant_name:
+                        registrant_name = w.name or w.org or w.registrant_name
+                    if w.country:
+                        registrant_country = w.country
+                    if w.name_servers:
+                        ns_list = [str(ns) for ns in w.name_servers]
+                        name_servers = ";".join(ns_list)
+            except Exception as e:
+                logger.debug("WHOIS lookup failed for %s: %s", host, e)
 
         # --- IP lookup ---
         # Try to get from features file first

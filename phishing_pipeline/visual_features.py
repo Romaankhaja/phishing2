@@ -495,18 +495,12 @@ def extract_ocr_text(image_path: str) -> str:
             img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
             
         img_np = np.array(img)
-            
+        
         # Use the getter function to ensure the model is loaded
         reader = _get_ocr_reader()
         results = reader.readtext(img_np, detail=0)  # detail=0 → only text
         txt = " ".join(results)
         txt = re.sub(r"\s+", " ", txt).strip()
-        # GPU memory cleanup after each OCR call (if using GPU)
-        try:
-            import torch
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
         return txt
     except FileNotFoundError:
         logger.warning("Image file not found for OCR: %s", image_path)
@@ -514,6 +508,15 @@ def extract_ocr_text(image_path: str) -> str:
     except Exception as e:
         logger.error("OCR extraction failed for %s: %s", image_path, e)
         return ""
+    finally:
+        # GPU memory cleanup after EVERY OCR call (success or failure)
+        try:
+            import torch
+            import gc
+            torch.cuda.empty_cache()
+            gc.collect()  # Force Python garbage collection too
+        except Exception:
+            pass
 
 # ------------------ Sharpness ------------------
 def laplacian_variance(image_path: str, min_size: int = 50) -> float:
