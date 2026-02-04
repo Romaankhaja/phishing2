@@ -487,8 +487,8 @@ def extract_ocr_text(image_path: str) -> str:
         # Optimize image for OCR to save VRAM
         img = Image.open(image_path).convert('L') # Convert to grayscale
         
-        # Downscale if too large (limit width to 1280px)
-        max_width = 1280
+        # Downscale if too large (limit width to 800px for 2GB VRAM GPU)
+        max_width = 800
         if img.width > max_width:
             ratio = max_width / img.width
             new_height = int(img.height * ratio)

@@ -44,10 +44,15 @@ class ResourceMonitor:
                 if used_mem_pct > self.gpu_threshold:
                     logger.debug(f"Throttling: High GPU memory usage ({used_mem_pct:.1f}%)")
                     return False
+            except RuntimeError as e:
+                # CUDA OOM during check means we should definitely throttle
+                if "out of memory" in str(e).lower():
+                    logger.warning("GPU exhausted during resource check, forcing throttle")
+                    torch.cuda.empty_cache()  # Try to recover
+                    return False
+                logger.warning(f"Error checking GPU resources: {e}")
             except Exception as e:
                 logger.warning(f"Error checking GPU resources: {e}")
-                # If check fails, assume safe to proceed but warn
-                pass
 
         return True
 
