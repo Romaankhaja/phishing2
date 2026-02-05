@@ -92,10 +92,18 @@ BRAND_COLORS = {
 BRAND_KEYWORDS = {"sbi", "airtel", "irctc", "nic", "iocl", "baroda"}
 
 TRUSTED_REGISTRARS = {"godaddy", "gmo internet", "markmonitor", "verisign"}
-SUSPICIOUS_REGISTRARS = {"namecheap", "freenom", "dynadot", "pdr ltd"}
+SUSPICIOUS_REGISTRARS = {
+    "namecheap", "freenom", "dynadot", "pdr ltd",
+    "hostinger", "internet domain service bs corp", "regru", "west263", "enom", "tucows",
+    "nicenic", "shinjiru", "orange website", "flokinet", "njalla"
+}
 
 TRUSTED_HOSTS = {"amazon", "akamai", "cloudflare", "microsoft", "google"}
-SUSPICIOUS_HOSTS = {"hostinger", "ovh", "contabo", "digitalocean"}
+SUSPICIOUS_HOSTS = {
+    "hostinger", "ovh", "contabo", "digitalocean",
+    "colocrossing", "frantech", "hetzner", "linode", "vultr",
+    "namesilo", "public domain registry"
+}
 
 # ------------------------------------------------------------------
 # Helpers
@@ -351,7 +359,17 @@ def reclassify_label(domain, registrar, host, dns, ocr_text_from_csv):
     if any(r in reg for r in SUSPICIOUS_REGISTRARS) or any(h in hst for h in SUSPICIOUS_HOSTS):
         return "Suspected"
         
-    # Default to Legitimate if no other red flags are hit
+    if any(r in reg for r in SUSPICIOUS_REGISTRARS) or any(h in hst for h in SUSPICIOUS_HOSTS):
+        return "Suspected"
+        
+    # --- CRITICAL FIX: Fail-Safe Classification ---
+    # If the scraped data is "na" (WHOIS/DNS failed), we strictly CANNOT trust it.
+    # Defaulting to "Legitimate" logic requires POSITIVE confirmation of a trusted entity.
+    # If data is missing, we must default to "Suspected" or higher.
+    if reg == "na" and hst == "na":
+        return "Suspected"
+
+    # Default to Legitimate ONLY if valid data exists and no red flags found
     return "Legitimate"
 
 # ------------------------------------------------------------------
@@ -457,31 +475,43 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
         hosting_isp = "NA"
         hosting_country = "NA"
         
-        # --- WHOIS lookup (rate-limited) ---
+        # --- WHOIS lookup (rate-limited with retry) ---
         async with whois_semaphore:
-            try:
-                # Run blocking whois call in executor to avoid blocking event loop
-                loop = asyncio.get_running_loop()
-                w = await loop.run_in_executor(None, whois.whois, host)
-                if w:
-                    creation_date = w.creation_date
-                    if isinstance(creation_date, list):
-                        creation_date = creation_date[0]
-                    
-                    # Only overwrite "NA" if the value is not empty
-                    if creation_date:
-                        reg_date = str(creation_date)
-                    if w.registrar:
-                        registrar = w.registrar
-                    if w.name or w.org or w.registrant_name:
-                        registrant_name = w.name or w.org or w.registrant_name
-                    if w.country:
-                        registrant_country = w.country
-                    if w.name_servers:
-                        ns_list = [str(ns) for ns in w.name_servers]
-                        name_servers = ";".join(ns_list)
-            except Exception as e:
-                logger.debug("WHOIS lookup failed for %s: %s", host, e)
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    # Run blocking whois call in executor with timeout
+                    loop = asyncio.get_running_loop()
+                    w = await asyncio.wait_for(
+                        loop.run_in_executor(None, whois.whois, host),
+                        timeout=10
+                    )
+                    if w:
+                        creation_date = w.creation_date
+                        if isinstance(creation_date, list):
+                            creation_date = creation_date[0]
+                        
+                        # Only overwrite "NA" if the value is not empty
+                        if creation_date:
+                            reg_date = str(creation_date)
+                        if w.registrar:
+                            registrar = w.registrar
+                        if w.name or w.org or w.registrant_name:
+                            registrant_name = w.name or w.org or w.registrant_name
+                        if w.country:
+                            registrant_country = w.country
+                        if w.name_servers:
+                            ns_list = [str(ns) for ns in w.name_servers]
+                            name_servers = ";".join(ns_list)
+                    break  # Success, exit retry loop
+                except asyncio.TimeoutError:
+                    logger.warning("⚠️ WHOIS timeout for %s (attempt %d/%d)", host, attempt+1, max_retries)
+                except Exception as e:
+                    logger.warning("⚠️ WHOIS lookup failed for %s: %s (attempt %d/%d)", host, e, attempt+1, max_retries)
+                
+                # Exponential backoff before retry (except on last attempt)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s
 
         # --- IP lookup ---
         # Try to get from features file first

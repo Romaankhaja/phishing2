@@ -1431,3 +1431,57 @@ I've added a comprehensive progress bar to the pipeline using the `tqdm` library
 ### Implementation Details
 
 The progress bar is integrated into the `process_urls` function in `pipeline.py`. It uses an asynchronous tracking task that monitors the status of the `asyncio` domain processing tasks and updates the `tqdm` display every 0.5 seconds.
+
+---
+
+## 10. CUDA Out of Memory (OOM) Analysis
+
+*(Source: `cuda_oom_analysis.md`)*
+
+### Root Causes Identified
+
+| # | Root Cause | Impact |
+|---|------------|--------|
+| 1 | **Image size at 1280px** | 1280×900 = 1.15M pixels vs 800×600 = 0.48M (2.4x more VRAM) |
+| 2 | **ResourceMonitor GPU check triggers OOM** | `torch.cuda.mem_get_info()` fails when VRAM exhausted |
+| 3 | **EasyOCR model stays in VRAM** | ~500MB resident, never unloaded |
+| 4 | **Concurrent visual tasks** | Up to 8 screenshots compete for VRAM |
+
+### Fixes Applied
+
+| Priority | Fix | File | Impact |
+|----------|-----|------|--------|
+| 1 | **Set max_width = 800** | `visual_features.py:491` | 2.4x less VRAM |
+| 2 | **OOM-safe GPU check** with try-except | `resource_manager.py:47-55` | Prevents cascade |
+| 3 | **`finally` block cleanup** with `gc.collect()` | `visual_features.py:511-518` | Cleanup on failure |
+
+---
+
+## 11. Browser Lifecycle Fix (AsyncBrowserManager)
+
+*(Source: `implementation_plan.md`)*
+
+### Problem
+
+The error `BrowserContext.new_page: Target page, context or browser has been closed` occurs because a single shared browser context is invalidated when one task encounters a critical error.
+
+### Solution: Resilient Singleton Pattern
+
+Implemented `AsyncBrowserManager` class in `visual_features.py`:
+
+```python
+class AsyncBrowserManager:
+    async def get_context(self):
+        async with self._lock:
+            if self._context and not self._context.is_closed():
+                return self._context
+            await self._restart_browser()  # Auto-recovery
+            return self._context
+```
+
+### Key Features
+
+- **Automatic Recovery**: If context is closed, restarts browser automatically
+- **Thread-Safe**: Uses `asyncio.Lock()` to prevent race conditions
+- **Health Checks**: Validates context before returning
+- **Retry Logic**: Wraps `new_page()` calls with retry on `TargetClosedError`

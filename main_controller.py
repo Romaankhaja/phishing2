@@ -76,6 +76,23 @@ except ImportError as e:
     shortlisting = None
 
 
+def clear_gpu_memory():
+    """Clear GPU memory before pipeline run for better performance."""
+    try:
+        import torch
+        import gc
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            gc.collect()
+            free, total = torch.cuda.mem_get_info()
+            logger.info(f"🧹 GPU memory cleared. Free: {free/1024**3:.2f} GB / {total/1024**3:.2f} GB")
+        else:
+            logger.info("No CUDA GPU available, skipping memory cleanup")
+    except Exception as e:
+        logger.warning(f"Could not clear GPU memory: {e}")
+
+
 async def main():
     parser = argparse.ArgumentParser(description="Phishing Detection CLI Controller")
     
@@ -103,6 +120,9 @@ async def main():
         raise FileNotFoundError(f"Shortlisting folder '{args.shortlisting}' not found")
 
     try:
+        # 🧹 Clear GPU memory at the start of every run
+        clear_gpu_memory()
+        
         logger.info("Using whitelist file: %s", args.whitelist)
         logger.info("Using shortlisting folder: %s", args.shortlisting)
         if args.limit:
