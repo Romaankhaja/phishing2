@@ -25,6 +25,7 @@ from .visual_features import close_browser
 from .geoip_utils import enrich_with_geoip
 from .model_utils import load_models_and_preproc
 from .shortlisting import generate_shortlisted_csv
+from .rate_limiter import RateLimiter
 
 # ---
 # --- FIX 1: Define ROOT_DIR at the top so all functions can use it.
@@ -138,130 +139,114 @@ def adjust_source(org_name, whitelisted_domain, ml_source="Unknown"):
             return mapped
     return ml_source
 # ------------------------------------------------------------------
-# Feature extraction
+# Feature extraction (Chunked Processing for GPU Safety)
 # ------------------------------------------------------------------
-async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=None, whois_semaphore=None):
+CHUNK_SIZE = 50  # Process 50 domains at a time (tune for your system)
+
+async def process_urls(input_csv, output_csv=FEATURES_CSV, network_semaphore=None):
     """
-    Extract features using Optimized Producer-Consumer Pipeline.
+    Extract features using Chunked Processing Pipeline.
     
-    Stage 1: Network Features (Fast, High Concurrency)
-    Stage 2: Visual Features (Slow, throttled by ResourceMonitor)
+    Processes domains in chunks to prevent GPU memory fragmentation and OOM errors.
+    Each chunk: Network + Screenshots in parallel, then OCR sequentially.
     """
-    import csv 
-    from .resource_manager import ResourceMonitor
+    import csv
+    import gc
+    import torch
     from .utils import extract_network_features_async, extract_visual_features_async
     
     df = pd.read_csv(input_csv)
-    logger.info("⚙️ Starting Optimized Pipeline for %d domains...", len(df))
+    total_domains = len(df)
+    logger.info("⚙️ Starting Chunked Pipeline for %d domains (chunk size: %d)...", total_domains, CHUNK_SIZE)
     
     if df.empty:
-        with open(output_csv, mode="w", newline="", encoding="utf-8") as f: pass
+        with open(output_csv, mode="w", newline="", encoding="utf-8") as f:
+            pass
         return output_csv
-
-    # Initialize Resource Monitor
-    monitor = ResourceMonitor(
-        cpu_threshold=90.0, 
-        ram_threshold=85.0, 
-        gpu_threshold=90.0
-    )
     
-    # Use provided semaphores or create new ones if not passed
+    # Use provided semaphore or create new one
     if network_semaphore is None:
         network_semaphore = asyncio.Semaphore(50)
-    if whois_semaphore is None:
-        whois_semaphore = asyncio.Semaphore(2) 
     
-    # We will write results as they complete (Visual stage completeness determines final write)
-    # But we need to match Network results to Visual results.
-    # Approach:
-    # 1. Launch Network Task. Return partial dict.
-    # 2. Pass partial dict to Visual Task (which waits for resources).
-    # 3. Visual Task updates dict and writes to CSV.
+    # Convert DataFrame to list of dicts for chunking
+    rows = df.to_dict('records')
+    total_chunks = (total_domains + CHUNK_SIZE - 1) // CHUNK_SIZE
     
-    queue = asyncio.Queue()
+    # Open output file for writing
+    all_results = []
     
-    # Writer Task
-    async def writer_task():
-        with open(output_csv, mode="w", newline="", encoding="utf-8") as f:
-            writer = None
-            while True:
-                record = await queue.get()
-                if record is None: break
-                
-                if writer is None:
-                    writer = csv.DictWriter(f, fieldnames=list(record.keys()))
-                    writer.writeheader()
-                
-                writer.writerow(record)
-                f.flush()
-                queue.task_done()
-    
-    writer_handle = asyncio.create_task(writer_task())
-
-    # Pipeline Logic
-    async def process_domain(idx, row):
-        domain = row["Identified Phishing/Suspected Domain Name"]
-        
-        # --- Stage 1: Network (Fast) ---
-        # No resource check needed here, just bounded concurrency via semaphore
-        try:
-            net_feats = await extract_network_features_async(domain, network_semaphore)
-        except Exception as e:
-            logger.error(f"Network stage failed for {domain}: {e}")
-            net_feats = {}
-
-        # --- Stage 2: Visual (Resource Intensive) ---
-        # Wait for resources before starting heavy GPU/Browser work
-        await monitor.wait_for_resources()
-        
-        try:
-            # We don't pass a fixed semaphore here anymore; the Monitor acts as the gatekeeper.
-            # But we might still want a safety cap (e.g., 4 concurrent browsers) inside utils.
-            vis_feats, _ = await extract_visual_features_async(domain) 
-        except Exception as e:
-            logger.error(f"Visual stage failed for {domain}: {e}")
-            vis_feats = {}
-            
-        # Merge
-        # Note: Visual feats has the final 'url' (after redirects), so it overrides network's input url
-        final_url = vis_feats.get("url", domain)
-        full_record = {
-            "Cooresponding CSE": row["Cooresponding CSE"],
-            "Legitimate Domains": row["Legitimate Domains"],
-            **net_feats,
-            **vis_feats,
-            "url": final_url 
-        }
-        
-        await queue.put(full_record)
-        logger.info(f"✅ Completed: {domain}")
-
-    # Launch all tasks with progress bar
-    tasks = [asyncio.create_task(process_domain(i, r)) for i, r in df.iterrows()]
-    
-    # Progress bar: shows percentage, completed/total, and ETA
-    with tqdm(total=len(df), desc="Processing URLs", unit="domain", 
+    # Progress bar for chunks
+    with tqdm(total=total_domains, desc="🌐 Phase 1: Features", unit="domain", 
               bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
         
-        async def track_progress():
-            completed = 0
-            while completed < len(tasks):
-                await asyncio.sleep(0.5)  # Check every 0.5 seconds
-                done_count = sum(1 for t in tasks if t.done())
-                if done_count > completed:
-                    pbar.update(done_count - completed)
-                    completed = done_count
-        
-        # Run tasks and progress tracker concurrently
-        await asyncio.gather(
-            asyncio.gather(*tasks),
-            track_progress()
-        )
+        for chunk_idx in range(total_chunks):
+            start = chunk_idx * CHUNK_SIZE
+            end = min(start + CHUNK_SIZE, total_domains)
+            chunk_rows = rows[start:end]
+            
+            logger.info(f"📦 Processing chunk {chunk_idx + 1}/{total_chunks} ({len(chunk_rows)} domains)")
+            
+            # ============ STAGE A: Network + Screenshots in PARALLEL ============
+            async def process_single_domain(row):
+                domain = row["Identified Phishing/Suspected Domain Name"]
+                
+                # Network features (fast, CPU)
+                try:
+                    net_feats = await extract_network_features_async(domain, network_semaphore)
+                except Exception as e:
+                    logger.error(f"Network failed for {domain}: {e}")
+                    net_feats = {}
+                
+                # Visual features (screenshot + OCR + branding)
+                try:
+                    vis_feats, _ = await extract_visual_features_async(domain)
+                except Exception as e:
+                    logger.error(f"Visual failed for {domain}: {e}")
+                    vis_feats = {}
+                
+                # Merge results
+                final_url = vis_feats.get("url", domain)
+                return {
+                    "Cooresponding CSE": row.get("Cooresponding CSE", ""),
+                    "Legitimate Domains": row.get("Legitimate Domains", ""),
+                    **net_feats,
+                    **vis_feats,
+                    "url": final_url
+                }
+            
+            # Process all domains in this chunk
+            chunk_tasks = [process_single_domain(row) for row in chunk_rows]
+            chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
+            
+            # Filter out exceptions and collect valid results
+            for result in chunk_results:
+                if isinstance(result, Exception):
+                    logger.error(f"Chunk domain error: {result}")
+                else:
+                    all_results.append(result)
+            
+            pbar.update(len(chunk_rows))
+            
+            # ============ GPU CLEANUP BETWEEN CHUNKS ============
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+                logger.debug(f"🧹 GPU cleanup after chunk {chunk_idx + 1}")
+            except Exception:
+                pass
     
-    # Cleanup
-    await queue.put(None)
-    await writer_handle
+    # Write all results to CSV
+    if all_results:
+        with open(output_csv, mode="w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(all_results[0].keys()))
+            writer.writeheader()
+            writer.writerows(all_results)
+    else:
+        with open(output_csv, mode="w", newline="", encoding="utf-8") as f:
+            pass
     
+    logger.info(f"✅ Phase 1 complete: {len(all_results)} domains processed")
     return output_csv
 
 # ------------------------------------------------------------------
@@ -376,11 +361,17 @@ def reclassify_label(domain, registrar, host, dns, ocr_text_from_csv):
 # Pipeline runner
 # ------------------------------------------------------------------
 async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=None, use_existing_holdout=False):
+    import time
+    from tqdm import tqdm as tqdm_sync
+    
+    start_time = time.time()
     logger.info("🚀 Starting pipeline...")
     
     # Initialize semaphores here to be shared with process_urls
     network_semaphore = asyncio.Semaphore(50)
-    whois_semaphore = asyncio.Semaphore(2)
+    
+    # Rate limiter: 20 requests per minute = 1 request every 3 seconds
+    whois_rate_limiter = RateLimiter(requests_per_minute=20)
     
     # ROOT_DIR is now defined at the top of the file
     
@@ -417,10 +408,39 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
     temp_csv_path = os.path.join(os.path.dirname(__file__), "holdout_temp.csv")
     df_filtered.to_csv(temp_csv_path, index=False, encoding="utf-8")
     
-    await process_urls(temp_csv_path, FEATURES_CSV, network_semaphore, whois_semaphore)
+    total_domains = len(df_filtered)
+    
+    # ================== MASTER PROGRESS TRACKER ==================
+    print("\n" + "="*70)
+    print(f"📊 PIPELINE OVERVIEW: {total_domains} domains")
+    print("="*70)
+    print("  Phase 1: Feature Extraction (Network + Screenshots + OCR)")
+    print("  Phase 2: WHOIS Lookup & Classification")
+    print("  Phase 3: Evidence Generation & Export")
+    print("="*70 + "\n")
+    
+    master_pbar = tqdm_sync(
+        total=100,
+        desc="🔄 Overall Progress",
+        unit="%",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}% [{elapsed}<{remaining}]",
+        position=0
+    )
+    
+    # ================== PHASE 1: Feature Extraction (60% of total work) ==================
+    logger.info("\n" + "="*60)
+    logger.info("📊 PHASE 1: Feature Extraction")
+    logger.info("="*60)
+    
+    phase1_start = time.time()
+    await process_urls(temp_csv_path, FEATURES_CSV, network_semaphore)
     df_features = pd.read_csv(FEATURES_CSV)
     df_features = enrich_with_geoip(df_features, ASN_DB_PATH, CITY_DB_PATH)
     df_features.to_csv(FEATURES_ENRICH, index=False, encoding="utf-8")
+    phase1_time = time.time() - phase1_start
+    
+    master_pbar.update(60)  # Phase 1 = 60% of work
+    logger.info("✅ Phase 1 Complete: %d domains in %.1f seconds", len(df_features), phase1_time)
 
     # ---------------- Load models ----------------
     model_label, model_source, le_label, source_classes, feature_cols, scaler, imputer = load_models_and_preproc()
@@ -455,148 +475,196 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
         for org, dom, ml_source in zip(df_features["Cooresponding CSE"], df_features["Legitimate Domains"], df_features["Predicted Source"])
     ]
 
-    # ---------------- Collect WHOIS/DNS and write output ----------------
-    records = []
-    for idx, row in df_features.iterrows():
+            # --- New Helper for Phase 2 Concurrency ---
+            
+async def process_single_domain_phase2(idx, row, adjusted_source, whois_rate_limiter, semaphore, application_id):
+    """
+    Process a single domain for Phase 2: WHOIS, DNS, IP, Evidence, Classification.
+    Split into:
+      1. WHOIS (Slow, Rate-Limited)
+      2. Non-WHOIS (Fast, Concurrent)
+    """
+    async with semaphore:
         domain_url = row["url"]
         host = urlparse(domain_url).hostname or domain_url
         host = host.split(':')[0]
-
-        # ---
-        # --- NEW: Default all variables to "NA" ---
-        # ---
-        reg_date = "NA"
-        registrar = "NA"
-        registrant_name = "NA"
-        registrant_country = "NA"
-        name_servers = "NA"
-        ip = "NA"
-        dns_records = "NA"
-        hosting_isp = "NA"
-        hosting_country = "NA"
         
-        # --- WHOIS lookup (rate-limited with retry) ---
-        async with whois_semaphore:
-            max_retries = 2
-            for attempt in range(max_retries):
-                try:
-                    # Run blocking whois call in executor with timeout
-                    loop = asyncio.get_running_loop()
-                    w = await asyncio.wait_for(
-                        loop.run_in_executor(None, whois.whois, host),
-                        timeout=10
-                    )
-                    if w:
-                        creation_date = w.creation_date
-                        if isinstance(creation_date, list):
-                            creation_date = creation_date[0]
-                        
-                        # Only overwrite "NA" if the value is not empty
-                        if creation_date:
-                            reg_date = str(creation_date)
-                        if w.registrar:
-                            registrar = w.registrar
-                        if w.name or w.org or w.registrant_name:
-                            registrant_name = w.name or w.org or w.registrant_name
-                        if w.country:
-                            registrant_country = w.country
-                        if w.name_servers:
-                            ns_list = [str(ns) for ns in w.name_servers]
-                            name_servers = ";".join(ns_list)
-                    break  # Success, exit retry loop
-                except asyncio.TimeoutError:
-                    logger.warning("⚠️ WHOIS timeout for %s (attempt %d/%d)", host, attempt+1, max_retries)
-                except Exception as e:
-                    logger.warning("⚠️ WHOIS lookup failed for %s: %s (attempt %d/%d)", host, e, attempt+1, max_retries)
-                
-                # Exponential backoff before retry (except on last attempt)
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s
+        # Initialize results
+        whois_data = {
+            "reg_date": "NA", "registrar": "NA", "registrant_name": "NA",
+            "registrant_country": "NA", "name_servers": "NA"
+        }
+        infra_data = {
+            "ip": "NA", "dns_records": "NA", "hosting_isp": "NA", "hosting_country": "NA",
+            "evidence_name": "NA", "classification": "Suspected"
+        }
 
-        # --- IP lookup ---
-        # Try to get from features file first
-        ip_from_features = row.get("ip_address", None)
-        if ip_from_features and not pd.isna(ip_from_features):
-            ip = str(ip_from_features)
-        else:
-            try:
-                ip_socket = socket.gethostbyname(host)
-                if ip_socket:
-                    ip = ip_socket
-            except Exception as e:
-                logger.debug("Socket IP lookup failed for %s: %s", host, e)
-        
-        # --- DNS lookup ---
-        try:
-            dns_recs = []
-            if host:
-                for qtype in ["A", "NS", "MX", "CNAME"]:
-                    try:
-                        answers = dns.resolver.resolve(host, qtype, lifetime=3)
-                        dns_recs.extend([f"{qtype}:{r.to_text()}" for r in answers])
-                    except:
-                        pass
-            if dns_recs:
-                dns_records = ";".join(dns_recs)
-        except Exception as e:
-            logger.debug("DNS lookup failed for %s: %s", host, e)
-
-        # --- GeoIP/ISP lookup (from features file) ---
-        isp_from_features = row.get("asn_org", None)
-        if isp_from_features and not pd.isna(isp_from_features):
-            hosting_isp = str(isp_from_features)
+        # --- Task A: WHOIS (Rate Limited) ---
+        async def run_whois():
+            # Acquire rate limit token (this will sleep if needed)
+            await whois_rate_limiter.acquire()
             
-        country_from_features = row.get("country", None)
-        if country_from_features and not pd.isna(country_from_features):
-            hosting_country = str(country_from_features)
+            try:
+                # Run blocking whois in executor
+                loop = asyncio.get_running_loop()
+                w = await asyncio.wait_for(
+                    loop.run_in_executor(None, whois.whois, host),
+                    timeout=15
+                )
+                if w:
+                    creation_date = w.creation_date
+                    if isinstance(creation_date, list):
+                        creation_date = creation_date[0]
+                    
+                    if creation_date: whois_data["reg_date"] = str(creation_date)
+                    if w.registrar: whois_data["registrar"] = w.registrar
+                    if w.name or w.org or w.registrant_name: 
+                        whois_data["registrant_name"] = w.name or w.org or w.registrant_name
+                    if w.country: whois_data["registrant_country"] = w.country
+                    if w.name_servers:
+                        ns_list = [str(ns) for ns in w.name_servers]
+                        whois_data["name_servers"] = ";".join(ns_list)
+            except asyncio.TimeoutError:
+                # logger.warning("WHOIS timeout for %s", host)
+                pass
+            except Exception as e:
+                # logger.warning("WHOIS failed for %s: %s", host, e)
+                pass
+            return whois_data
 
-        # --- Evidence and screenshot ---
-        evidence_path, evidence_name = format_evidence_filename(
-            # --- Use the new column name ---
-            row["Cooresponding CSE"], domain_url, idx+1, application_id=APPLICATION_ID
-        )
-        move_screenshot_to_evidence(domain_url, evidence_path)
+        # --- Task B: Infra / Evidence / Reclassification (Concurrent) ---
+        async def run_infra_and_evidence():
+            # 1. IP Lookup
+            ip_from_features = row.get("ip_address", None)
+            if ip_from_features and not pd.isna(ip_from_features):
+                infra_data["ip"] = str(ip_from_features)
+            else:
+                try:
+                    ip_socket = socket.gethostbyname(host)
+                    if ip_socket: infra_data["ip"] = ip_socket
+                except Exception:
+                    pass
 
-        # ---
-        # --- FINAL FIX: Pass the ocr_text from the CSV to the reclassify function
-        # ---
-        ocr_text_from_csv = row.get("ocr_text", "")
+            # 2. DNS Lookup
+            try:
+                dns_recs = []
+                if host:
+                    for qtype in ["A", "NS", "MX", "CNAME"]:
+                        try:
+                            # Use executor for blocking DNS calls to avoid blocking loop
+                            loop = asyncio.get_running_loop()
+                            answers = await loop.run_in_executor(None, lambda: list(dns.resolver.resolve(host, qtype, lifetime=3)))
+                            dns_recs.extend([f"{qtype}:{r.to_text()}" for r in answers])
+                        except:
+                            pass
+                if dns_recs:
+                    infra_data["dns_records"] = ";".join(dns_recs)
+            except Exception:
+                pass
+
+            # 3. GeoIP / ISP
+            isp_feat = row.get("asn_org", None)
+            if isp_feat and not pd.isna(isp_feat): infra_data["hosting_isp"] = str(isp_feat)
+            
+            cnt_feat = row.get("country", None)
+            if cnt_feat and not pd.isna(cnt_feat): infra_data["hosting_country"] = str(cnt_feat)
+
+            # 4. Evidence
+            evidence_path, evidence_name = format_evidence_filename(
+                row["Cooresponding CSE"], domain_url, idx+1, application_id=application_id
+            )
+            # This function does file I/O and image processing
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, move_screenshot_to_evidence, domain_url, evidence_path)
+            infra_data["evidence_name"] = evidence_name
+
+            return infra_data
+
+        # Run Task A and Task B concurrently
+        # WHOIS waits for token, Infra runs immediately
+        results = await asyncio.gather(run_whois(), run_infra_and_evidence(), return_exceptions=True)
+        
+        # Process results
+        # run_whois updates `whois_data` in place (or we use return value)
+        # run_infra updates `infra_data` in place
+        
+        # Classification (needs data from both)
+        # Note: 'registrar' comes from WHOIS, 'hosting_isp' from Infra, 'dns_records' from Infra
+        
+        ocr_text = row.get("ocr_text", "")
         classification = reclassify_label(
-            domain_url, registrar, hosting_isp, dns_records, ocr_text_from_csv
+            domain_url, 
+            whois_data["registrar"], 
+            infra_data["hosting_isp"], 
+            infra_data["dns_records"], 
+            ocr_text
         )
 
         detection_date = datetime.now().strftime("%d-%m-%Y")
         detection_time = datetime.now().strftime("%H:%M:%S")
 
-        # ---
-        # --- Append the record (all fields will be "NA" if not found) ---
-        # ---
-        records.append({
-            "Application_ID": APPLICATION_ID,
-            "Source of detection": adjusted_sources[idx],
+        return {
+            "Application_ID": application_id,
+            "Source of detection": adjusted_source,
             "Identified Phishing/Suspected Domain Name": domain_url,
-            # --- Use the new column names ---
             "Corresponding CSE Domain Name": row["Legitimate Domains"],
             "Critical Sector Entity Name": row["Cooresponding CSE"],
             "Phishing/Suspected Domains (i.e. Class Label)": classification,
-            # --- "Predicted Label" REMOVED ---
-            "Domain Registration Date": reg_date,
-            "Registrar Name": registrar,
-            "Registrant Name or Registrant Organisation": registrant_name,
-            "Registrant Country": registrant_country,
-            "Name Servers": name_servers,
-            "Hosting IP": ip,
-            "Hosting ISP": hosting_isp,
-            "Hosting Country": hosting_country,
-            "DNS Records (if any)": dns_records,
-            "Evidence file name": evidence_name,
+            "Domain Registration Date": whois_data["reg_date"],
+            "Registrar Name": whois_data["registrar"],
+            "Registrant Name or Registrant Organisation": whois_data["registrant_name"],
+            "Registrant Country": whois_data["registrant_country"],
+            "Name Servers": whois_data["name_servers"],
+            "Hosting IP": infra_data["ip"],
+            "Hosting ISP": infra_data["hosting_isp"],
+            "Hosting Country": infra_data["hosting_country"],
+            "DNS Records (if any)": infra_data["dns_records"],
+            "Evidence file name": infra_data["evidence_name"],
             "Date of detection (DD-MM-YYYY)": detection_date,
             "Time of detection (HH-MM-SS)": detection_time,
-            "Date of Post (If detection is from Source: social media)": "NA", # Always NA
-            # --- "Remarks" Column ADDED ---
+            "Date of Post (If detection is from Source: social media)": "NA",
             "Remarks": "NA values are due to privacy issues."
-        })
+        }
 
+    # ================== PHASE 2: WHOIS & Classification (35% of total work) ==================
+    phase2_start = time.time()
+    logger.info("\n" + "="*60)
+    logger.info("📊 PHASE 2: WHOIS & Classification (Parallel)")
+    logger.info("="*60)
+    
+    records = []
+    total_domains = len(df_features)
+    
+    # Semaphore for total concurrent active domains (Non-WHOIS concurrency)
+    # We allow 50 concurrent domains to process DNS/PDF/etc.
+    # WHOIS is further throttled by its own 20/min limiter.
+    phase2_semaphore = asyncio.Semaphore(50)
+    
+    tasks = []
+    for idx, row in df_features.iterrows():
+        source = adjusted_sources[idx]
+        task = asyncio.create_task(process_single_domain_phase2(
+            idx, row, source, whois_rate_limiter, phase2_semaphore, APPLICATION_ID
+        ))
+        tasks.append(task)
+    
+    logger.info(f"Queued {len(tasks)} tasks. Starting execution...")
+    
+    # Run tasks and update progress bar as they complete
+    from tqdm.asyncio import tqdm as tqdm_async
+    
+    # We use a simple loop with as_completed for the progress bar
+    for future in tqdm_async.as_completed(tasks, desc="🔍 Phase 2 Processing", unit="domain"):
+        try:
+            record = await future
+            records.append(record)
+        except Exception as e:
+            logger.error(f"Task failed: {e}")
+            
+    phase2_time = time.time() - phase2_start
+    master_pbar.update(35)  # Phase 2 = 35% of work
+    logger.info("✅ Phase 2 Complete: %d records in %.1f seconds", len(records), phase2_time)
+    
     df_out = pd.DataFrame(records)
     # Save to CSV
     df_out.to_csv(FINAL_OUTPUT, index=False, encoding="utf-8")
@@ -639,6 +707,18 @@ async def run_pipeline(holdout_folder, ps02_whitelist_file, limit_whitelisted=No
     except Exception as e:
         logger.warning("⚠ Could not remove temporary file: %s", e)
 
+    # Final progress update and timing
+    master_pbar.update(5)  # Phase 3 (filtering/cleanup) = 5%
+    master_pbar.close()
+    
+    total_time = time.time() - start_time
+    print("\n" + "="*70)
+    print(f"✅ PIPELINE COMPLETE")
+    print(f"   Total domains: {total_domains}")
+    print(f"   Total time: {total_time/60:.1f} minutes ({total_time:.0f} seconds)")
+    print(f"   Average: {total_time/total_domains:.2f} seconds/domain")
+    print("="*70 + "\n")
+    
     return df_out
     
     # Note: run_pipeline does NOT close the browser context automatically here anymore

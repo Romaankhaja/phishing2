@@ -13,9 +13,9 @@ from datetime import datetime
 from phishing_pipeline import pipeline, shortlisting, visual_features
 from phishing_pipeline.config import FINAL_OUTPUT
 
-DATASET_PATH = "PS-02_hold-out_Set_2\domains.xlsx"
+DATASET_PATH = r"PS-02_hold-out_Set_2\PS-02_hold-out_Set_2_Part_6.xlsx"
 WHITELIST_PATH = "uploads/PS-02_hold-out_Set1_Legitimate_Domains_for_10_CSEs.xlsx"
-LIMIT_SAMPLES = None  # Set to None for full run, or e.g. 100 for quick test
+LIMIT_SAMPLES = 20  # Set to None for full run, or e.g. 100 for quick test
 
 def get_stats():
     cpu_mem = psutil.virtual_memory().percent
@@ -47,11 +47,26 @@ async def run_full_pipeline_benchmark():
             print("❌ Could not find 'domain_name' column in dataset.")
             return
         df['domain'] = df['domain_name'].astype(str).str.lower()
-        filtered_df = df.copy()
         # Add 'Legitimate Domains' column to match pipeline expectations
-        filtered_df['Legitimate Domains'] = filtered_df['domain']
+        # FIX: We must use a domain that exists in the whitelist, otherwise pipeline.py filters everything out!
+        try:
+            wl_df = pd.read_excel(WHITELIST_PATH)
+            valid_legit = wl_df["Legitimate Domains"].dropna().iloc[0]
+            valid_cse = wl_df["Cooresponding CSE"].dropna().iloc[0]
+            print(f"Using valid whitelist domain for benchmark: {valid_legit} ({valid_cse})")
+        except Exception as e:
+            print(f"❌ Failed to read whitelist for mock data: {e}")
+            return
+
+        filtered_df = df.copy().head(LIMIT_SAMPLES if LIMIT_SAMPLES else len(df))
+        filtered_df['Legitimate Domains'] = valid_legit
+        filtered_df['Cooresponding CSE'] = valid_cse
+        # Ensure 'Identified Phishing...' column exists
+        if 'Identified Phishing/Suspected Domain Name' not in filtered_df.columns:
+             filtered_df['Identified Phishing/Suspected Domain Name'] = filtered_df['domain']
+
         n_candidates = len(filtered_df)
-        print(f"✅ Shortlisting complete: {n_candidates} candidates from {os.path.basename(DATASET_PATH)} (no whitelist filtering).")
+        print(f"✅ Shortlisting complete (MOCK): {n_candidates} candidates prepared.")
         print(f"DataFrame shape: {filtered_df.shape}")
         if n_candidates == 0:
             print("❌ No data to process. Exiting benchmark before pipeline step.")

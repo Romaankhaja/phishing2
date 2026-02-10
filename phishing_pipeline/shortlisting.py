@@ -79,21 +79,134 @@ def get_primary_part(url: str) -> str:
 
 def is_similar_advanced(cand_url_norm: str, legit_url_norm: str,
                         cand_primary: str, legit_primary: str, legit_parts: set) -> bool:
+    """
+    Legacy single-pair check. 
+    (Kept for compatibility or fallback, though the batch process supersedes it for bulk ops).
+    """
     if not cand_primary or not legit_primary:
         return False
     if cand_url_norm == legit_url_norm:
         return False
+    
+    # Optimized: use rapidfuzz for everything
     try:
-        if jellyfish.jaro_winkler_similarity(cand_primary, legit_primary) >= 0.85:
+        # RapidFuzz JaroWinkler similarity (0.0 - 1.0)
+        if fuzz.jaro_winkler_similarity(cand_primary, legit_primary) >= 0.85:
             return True
     except Exception:
         pass
+        
     try:
+        # RapidFuzz Token Set Ratio (0 - 100)
         if fuzz.token_set_ratio(cand_primary, legit_primary) >= 90:
             return True
     except Exception:
         pass
     return False
+
+def batch_match_candidates(candidates: list, whitelist: list, chunk_size: int = 5000) -> list:
+    """
+    Optimized batch matching using RapidFuzz.
+    
+    Args:
+        candidates: List of dicts (with 'primary', 'url', etc.)
+        whitelist: List of dicts (with 'primary', 'url', 'org')
+        chunk_size: Number of candidates to process at once to manage memory
+        
+    Returns:
+        List of matched rows (dicts)
+    """
+    from rapidfuzz import process, fuzz, distance
+    import numpy as np
+    
+    results = []
+    
+    # Extract primary strings for vectorized comparison
+    cand_primaries = [c["primary"] for c in candidates]
+    white_primaries = [w["primary"] for w in whitelist]
+    
+    # If lists are empty, return
+    if not cand_primaries or not white_primaries:
+        return results
+        
+    n_cands = len(cand_primaries)
+    
+    # Process in chunks to prevent memory explosion with cdist
+    for i in range(0, n_cands, chunk_size):
+        end = min(i + chunk_size, n_cands)
+        chunk_indices = range(i, end)
+        chunk_cands_primaries = cand_primaries[i:end]
+        
+        # --- Check 1: JaroWinkler (Threshold >= 0.85) ---
+        # cdist returns a matrix of similarities
+        # workers=-1 uses all available cores
+        jw_matrix = process.cdist(
+            chunk_cands_primaries, 
+            white_primaries, 
+            scorer=distance.JaroWinkler.similarity, 
+            workers=-1
+        )
+        
+        # Find indices where similarity >= 0.85
+        # jw_matrix is (n_chunk, n_whitelist)
+        # Using numpy for fast filtering
+        matches = np.argwhere(jw_matrix >= 0.85)
+        
+        # matches is a list of [row_idx, col_idx]
+        # row_idx is relative to the chunk
+        for row_idx, col_idx in matches:
+            cand_idx = i + row_idx
+            white_idx = col_idx
+            
+            cand = candidates[cand_idx]
+            legit = whitelist[white_idx]
+            
+            # Skip exact normalization matches (same exact domain)
+            if cand["norm_url"] == legit["norm_url"]:
+                continue
+                
+            results.append({
+                "Cooresponding CSE": legit["org"],
+                "Legitimate Domains": legit["url"],
+                "Identified Phishing/Suspected Domain Name": cand["url"]
+            })
+            
+        # --- Check 2: Token Set Ratio (Threshold >= 90) ---
+        # Only check candidates that haven't matched yet? 
+        # Or check all? The original code checks both OR (implied).
+        # To avoid duplicates, we could filter, but let's just run it 
+        # and drop duplicates at the very end (which the caller calculates).
+        # OR: faster to just do it all.
+        
+        # Note: cdist with token_set_ratio might be slower than JaroWinkler.
+        # But still faster than Python loop.
+        ts_matrix = process.cdist(
+            chunk_cands_primaries,
+            white_primaries,
+            scorer=fuzz.token_set_ratio,
+            workers=-1
+        )
+        
+        matches_ts = np.argwhere(ts_matrix >= 90)
+        
+        for row_idx, col_idx in matches_ts:
+            cand_idx = i + row_idx
+            white_idx = col_idx
+             
+            cand = candidates[cand_idx]
+            legit = whitelist[white_idx]
+            
+            # Skip exact normalization matches
+            if cand["norm_url"] == legit["norm_url"]:
+                continue
+                
+            results.append({
+                "Cooresponding CSE": legit["org"],
+                "Legitimate Domains": legit["url"],
+                "Identified Phishing/Suspected Domain Name": cand["url"]
+            })
+            
+    return results
 
 def load_urls_from_excel_folder(folder_path):
     logger.info(f"Reading Excel files from: {folder_path}")
@@ -237,23 +350,19 @@ def run_shortlisting_process(holdout_folder: str | None = None,
     all_rows, seen = [], set()
     logger.info("Starting advanced matching... (Candidates: %d, Whitelist: %d)", len(candidates_processed), len(whitelist_processed))
 
-    for cand in candidates_processed:
-        if cand["url"] in seen:
-            continue
-        for legit in whitelist_processed:
-            if is_similar_advanced(
-                cand["norm_url"], legit["norm_url"],
-                cand["primary"], legit["primary"], legit["parts"]
-            ):
-                key = (legit["org"], legit["url"], cand["url"])
-                if key not in seen:
-                    seen.add(key)
-                    all_rows.append({
-                        "Cooresponding CSE": legit["org"],
-                        "Legitimate Domains": legit["url"],
-                        "Identified Phishing/Suspected Domain Name": cand["url"]
-                    })
-                break
+    all_rows, seen = [], set()
+    logger.info("Starting advanced matching (Optimized)... (Candidates: %d, Whitelist: %d)", len(candidates_processed), len(whitelist_processed))
+
+    # Use the batched processor
+    # This replaces the nested loop
+    raw_matches = batch_match_candidates(candidates_processed, whitelist_processed)
+    
+    # Deduplicate results
+    for match in raw_matches:
+        key = (match["Cooresponding CSE"], match["Legitimate Domains"], match["Identified Phishing/Suspected Domain Name"])
+        if key not in seen:
+            seen.add(key)
+            all_rows.append(match)
 
     out_df = pd.DataFrame(all_rows).drop_duplicates()
     if write_outputs and not out_df.empty:
